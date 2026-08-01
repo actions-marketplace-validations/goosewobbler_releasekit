@@ -54,8 +54,9 @@ describe('createStandingPRCommand', () => {
     }) as never);
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
+      // Exits with INPUT_ERROR (3), not the general error code.
       await expect(parseCommand(['publish', '--project-dir', '/test', '--pr', '123abc'])).rejects.toThrow(
-        /process\.exit/,
+        /process\.exit\(3\)/,
       );
       expect(runStandingPRPublish).not.toHaveBeenCalled();
       expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('positive integer'));
@@ -63,6 +64,89 @@ describe('createStandingPRCommand', () => {
       exitSpy.mockRestore();
       errSpy.mockRestore();
     }
+  });
+
+  it('should emit an INPUT_ERROR envelope for an invalid --pr in json mode', async () => {
+    const { runStandingPRPublish } = await import('../../src/standing-pr/standing-pr.js');
+    vi.mocked(runStandingPRPublish).mockClear();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(parseCommand(['publish', '--project-dir', '/test', '--json', '--pr', 'abc'])).rejects.toThrow(
+        /process\.exit\(3\)/,
+      );
+      const envelope = JSON.parse(logSpy.mock.calls[0]?.[0] as string);
+      expect(envelope.status).toBe('error');
+      expect(envelope.errors[0]).toMatchObject({ code: 'INPUT_ERROR', category: 'input', retryable: false });
+    } finally {
+      exitSpy.mockRestore();
+      logSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  // The manifest's versionOutput.updates is populated on every publish run, so it can't distinguish a
+  // real publish from an idempotent re-run — `changed` has to come from the publish effects.
+  describe('publish changed reporting', () => {
+    const manifestVersionOutput = {
+      dryRun: false,
+      updates: [{ packageName: '@acme/widget', currentVersion: '1.4.2', newVersion: '2.0.0', bumpType: 'major' }],
+      changelogs: [],
+      tags: ['v2.0.0'],
+    };
+    const npmResult = { packageName: '@acme/widget', version: '2.0.0', registry: 'npm', success: true };
+
+    async function publishEnvelope(publishOutput: unknown) {
+      const { runStandingPRPublish } = await import('../../src/standing-pr/standing-pr.js');
+      vi.mocked(runStandingPRPublish).mockResolvedValueOnce({
+        versionOutput: manifestVersionOutput,
+        notesGenerated: false,
+        publishOutput,
+      } as never);
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        await parseCommand(['publish', '--project-dir', '/test', '--json', '--pr', '189']);
+        return JSON.parse(logSpy.mock.calls[0]?.[0] as string);
+      } finally {
+        logSpy.mockRestore();
+      }
+    }
+
+    it('should report changed:true when a package actually published', async () => {
+      const envelope = await publishEnvelope({
+        dryRun: false,
+        git: { committed: false, tags: ['v2.0.0'], pushed: true },
+        npm: [{ ...npmResult, skipped: false }],
+        cargo: [],
+        pub: [],
+        verification: [],
+        githubReleases: [],
+        publishSucceeded: true,
+      });
+      expect(envelope.status).toBe('success');
+      expect(envelope.changed).toBe(true);
+    });
+
+    it('should report changed:false when every version was already published', async () => {
+      const envelope = await publishEnvelope({
+        dryRun: false,
+        // Tags pushed and the GitHub release "succeeded" (it already existed) — neither is a change.
+        git: { committed: false, tags: ['v2.0.0'], pushed: true },
+        npm: [{ ...npmResult, skipped: true, alreadyPublished: true }],
+        cargo: [],
+        pub: [],
+        verification: [],
+        githubReleases: [{ tag: 'v2.0.0', draft: false, prerelease: false, success: true }],
+        publishSucceeded: true,
+      });
+      expect(envelope.status).toBe('success');
+      expect(envelope.changed).toBe(false);
+      // The manifest payload still rides along untouched — the envelope wraps, never replaces.
+      expect(envelope.data.versionOutput.updates).toHaveLength(1);
+    });
   });
 
   it('should pass --verbose, --quiet, --json flags through', async () => {
