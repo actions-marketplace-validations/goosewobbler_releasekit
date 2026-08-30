@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v3.7.0
       - name: Setup workspace
         uses: ./.github/workflows/actions/setup-workspace
       - name: Build releasekit

@@ -30,7 +30,7 @@ jobs:
       actions: read # Required for Claude to read CI results on PRs
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@a37ce9120846195fa4ece8f58b268e6043cb2f26
         with:
           fetch-depth: 1
 

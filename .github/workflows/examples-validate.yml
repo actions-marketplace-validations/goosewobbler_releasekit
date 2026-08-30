@@ -40,7 +40,7 @@ jobs:
     name: actionlint (examples)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v3.7.0
 
       - name: Run actionlint over example workflows
         run: |
@@ -62,7 +62,7 @@ jobs:
     name: config schema (examples)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v3.7.0
 
       - uses: actions/setup-node@v7
         with:
@@ -93,7 +93,7 @@ jobs:
     name: smoke workflow up to date (examples)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v3.7.0
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
 
