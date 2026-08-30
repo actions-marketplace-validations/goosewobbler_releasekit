@@ -6,13 +6,25 @@ import { getDefaultConfig } from '../../../src/config.js';
 import { runNpmPublishStage } from '../../../src/stages/npm-publish.js';
 import type { PipelineContext } from '../../../src/types.js';
 
-vi.mock('../../../src/utils/exec.js', () => ({
-  execCommand: vi.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
-  execCommandSafe: vi.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 1 }), // not published by default
-}));
+vi.mock('../../../src/utils/exec.js', async () => {
+  const actual = await vi.importActual<typeof import('../../../src/utils/exec.js')>('../../../src/utils/exec.js');
+  return {
+    ...actual,
+    execCommand: vi.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
+    execCommandSafe: vi.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 1 }), // not published by default
+  };
+});
 
 vi.mock('../../../src/utils/auth.js', () => ({
   detectNpmAuth: vi.fn().mockReturnValue('token'),
+}));
+
+// Spy on `debug` (everything else from core stays real) to assert the absence of the misleading
+// "Failed to read package.json" log for non-npm manifests.
+const { debugMock } = vi.hoisted(() => ({ debugMock: vi.fn() }));
+vi.mock('@releasekit/core', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@releasekit/core')>()),
+  debug: debugMock,
 }));
 
 function createContext(cwd: string, overrides?: Partial<PipelineContext>): PipelineContext {
@@ -45,6 +57,7 @@ function createContext(cwd: string, overrides?: Partial<PipelineContext>): Pipel
       cargo: [],
       verification: [],
       githubReleases: [],
+      publishSucceeded: false,
     },
     ...overrides,
   };
@@ -89,16 +102,15 @@ describe('npm-publish stage', () => {
     const ctx = createContext(dir);
     await runNpmPublishStage(ctx);
 
-    expect(execCommand).toHaveBeenCalledTimes(1);
-    const call = vi.mocked(execCommand).mock.calls[0];
-    expect(call?.[0]).toBe('pnpm');
-    const args = call?.[1] as string[];
+    expect(execCommand).toHaveBeenCalledTimes(2); // version check + publish
+    const publishCall = vi.mocked(execCommand).mock.calls[1]; // publish is the second call
+    expect(publishCall?.[0]).toBe('pnpm');
+    const args = publishCall?.[1] as string[];
     expect(args).toContain('publish');
-    expect(args).toEqual(expect.arrayContaining(['--filter', '@test/pkg']));
     expect(args).toEqual(expect.arrayContaining(['--access', 'public']));
     expect(args).toEqual(expect.arrayContaining(['--tag', 'latest']));
 
-    const options = call?.[2];
+    const options = publishCall?.[2];
     expect(options?.env?.NPM_CONFIG_USERCONFIG).toBeTruthy();
     expect(options?.env?.NODE_AUTH_TOKEN).toBe('npm_test_token');
 
@@ -122,6 +134,58 @@ describe('npm-publish stage', () => {
     expect(execCommand).not.toHaveBeenCalled();
     expect(ctx.output.npm[0]?.skipped).toBe(true);
     expect(ctx.output.npm[0]?.reason).toContain('private');
+  });
+
+  it('should skip non-package.json manifests (Cargo.toml) without trying to read them', async () => {
+    const { execCommand } = await import('../../../src/utils/exec.js');
+    const dir = createTmpDir();
+
+    // No Cargo.toml is created on disk: the guard must skip before any read attempt.
+    const ctx = createContext(dir, {
+      input: {
+        dryRun: false,
+        updates: [{ packageName: 'my-crate', newVersion: '1.0.0', filePath: 'crates/my-crate/Cargo.toml' }],
+        changelogs: [],
+        tags: [],
+      },
+    });
+    await runNpmPublishStage(ctx);
+
+    expect(ctx.output.npm[0]?.skipped).toBe(true);
+    expect(ctx.output.npm[0]?.reason).toBe('Not an npm package');
+    expect(execCommand).not.toHaveBeenCalled();
+    // Regression: no confusing "Failed to read package.json" for a non-npm manifest.
+    expect(debugMock).not.toHaveBeenCalledWith(expect.stringContaining('Failed to read package.json'));
+  });
+
+  it('should use correct cwd for npm vs pnpm', async () => {
+    const { execCommand } = await import('../../../src/utils/exec.js');
+    const dir = createTmpDir();
+    const pkgDir = path.join(dir, 'packages', 'pkg');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: '@test/pkg', version: '1.0.0' }));
+
+    process.env.NPM_TOKEN = 'npm_test_token';
+
+    // Test pnpm (should use package cwd)
+    const pnpmCtx = createContext(dir, { packageManager: 'pnpm' });
+    await runNpmPublishStage(pnpmCtx);
+
+    expect(execCommand).toHaveBeenCalledTimes(2); // version check + publish
+    const pnpmPublishCall = vi.mocked(execCommand).mock.calls[1]; // publish is second
+    const pnpmOptions = pnpmPublishCall?.[2];
+    expect(pnpmOptions?.cwd).toBe(pkgDir); // pnpm now uses package directory
+
+    vi.clearAllMocks();
+
+    // Test npm (should use package cwd)
+    const npmCtx = createContext(dir, { packageManager: 'npm' });
+    await runNpmPublishStage(npmCtx);
+
+    expect(execCommand).toHaveBeenCalledTimes(2); // version check + publish
+    const npmPublishCall = vi.mocked(execCommand).mock.calls[1]; // publish is second
+    const npmOptions = npmPublishCall?.[2];
+    expect(npmOptions?.cwd).toBe(pkgDir); // npm uses package directory
   });
 
   it('should skip already-published packages', async () => {
@@ -158,8 +222,9 @@ describe('npm-publish stage', () => {
 
     await runNpmPublishStage(ctx);
 
-    const args = vi.mocked(execCommand).mock.calls[0]?.[1] as string[];
-    expect(args).toEqual(expect.arrayContaining(['--tag', 'next']));
+    expect(execCommand).toHaveBeenCalledTimes(2); // version check + publish
+    const publishArgs = vi.mocked(execCommand).mock.calls[1]?.[1] as string[]; // publish is second
+    expect(publishArgs).toEqual(expect.arrayContaining(['--tag', 'next']));
   });
 
   it('should add --provenance when OIDC auth', async () => {
@@ -176,10 +241,11 @@ describe('npm-publish stage', () => {
     const ctx = createContext(dir);
     await runNpmPublishStage(ctx);
 
-    const args = vi.mocked(execCommand).mock.calls[0]?.[1] as string[];
-    expect(args).toContain('--provenance');
+    expect(execCommand).toHaveBeenCalledTimes(2); // version check + publish
+    const publishArgs = vi.mocked(execCommand).mock.calls[1]?.[1] as string[]; // publish is second
+    expect(publishArgs).toContain('--provenance');
 
-    const options = vi.mocked(execCommand).mock.calls[0]?.[2];
+    const options = vi.mocked(execCommand).mock.calls[1]?.[2]; // publish options
     expect(options?.env?.NPM_CONFIG_USERCONFIG).toBeTruthy();
     expect(options?.env?.NODE_AUTH_TOKEN).toBeUndefined();
   });
@@ -197,8 +263,37 @@ describe('npm-publish stage', () => {
     const ctx = createContext(dir);
     await runNpmPublishStage(ctx);
 
-    const args = vi.mocked(execCommand).mock.calls[0]?.[1] as string[];
-    expect(args).not.toContain('--provenance');
+    expect(execCommand).toHaveBeenCalledTimes(2); // version check + publish
+    const publishArgs = vi.mocked(execCommand).mock.calls[1]?.[1] as string[]; // publish is second
+    expect(publishArgs).not.toContain('--provenance');
+  });
+
+  it('should treat EPUBLISHCONFLICT publish errors as already-published', async () => {
+    const { execCommand } = await import('../../../src/utils/exec.js');
+    // Pre-check (execCommandSafe) says not-published; npm publish then rejects.
+    vi.mocked(execCommand).mockImplementation(async (file, args) => {
+      if ((args as string[])?.includes('publish')) {
+        throw Object.assign(new Error('Command failed: pnpm publish'), {
+          stdout: '',
+          stderr:
+            'npm ERR! code EPUBLISHCONFLICT\nnpm ERR! 403 You cannot publish over the previously published versions: 1.0.0.',
+          exitCode: 1,
+        });
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+
+    const dir = createTmpDir();
+    const pkgDir = path.join(dir, 'packages', 'pkg');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: '@test/pkg', version: '1.0.0' }));
+
+    const ctx = createContext(dir);
+    await expect(runNpmPublishStage(ctx)).resolves.toBeUndefined();
+
+    expect(ctx.output.npm[0]?.alreadyPublished).toBe(true);
+    expect(ctx.output.npm[0]?.success).toBe(true);
+    expect(ctx.output.npm[0]?.skipped).toBe(true);
   });
 
   it('should throw on publish failure (fail-fast)', async () => {
@@ -214,6 +309,153 @@ describe('npm-publish stage', () => {
     await expect(runNpmPublishStage(ctx)).rejects.toThrow('ENEEDAUTH');
     expect(ctx.output.npm).toHaveLength(1);
     expect(ctx.output.npm[0]?.success).toBe(false);
+  });
+
+  it('should fail fast (zero retries) on a permanent auth error', async () => {
+    const { execCommand } = await import('../../../src/utils/exec.js');
+    let publishCalls = 0;
+    vi.mocked(execCommand).mockImplementation(async (_file, args) => {
+      if ((args as string[])?.includes('publish')) {
+        publishCalls++;
+        throw Object.assign(new Error('Command failed'), {
+          stdout: '',
+          stderr: 'npm ERR! code ENEEDAUTH\nnpm ERR! 401 Unauthorized',
+          exitCode: 1,
+        });
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+
+    const dir = createTmpDir();
+    const pkgDir = path.join(dir, 'packages', 'pkg');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: '@test/pkg', version: '1.0.0' }));
+
+    const ctx = createContext(dir);
+    await expect(runNpmPublishStage(ctx)).rejects.toThrow();
+    expect(publishCalls).toBe(1); // no retries
+    expect(ctx.output.npm[0]?.success).toBe(false);
+  });
+
+  it('should retry a transient registry error and succeed, recording attempts', async () => {
+    vi.useFakeTimers();
+    try {
+      const { execCommand } = await import('../../../src/utils/exec.js');
+      let publishCalls = 0;
+      vi.mocked(execCommand).mockImplementation(async (_file, args) => {
+        if ((args as string[])?.includes('publish')) {
+          publishCalls++;
+          if (publishCalls === 1) {
+            throw Object.assign(new Error('Command failed'), {
+              stdout: '',
+              stderr: 'npm ERR! 503 Service Unavailable',
+              exitCode: 1,
+            });
+          }
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+
+      const dir = createTmpDir();
+      const pkgDir = path.join(dir, 'packages', 'pkg');
+      fs.mkdirSync(pkgDir, { recursive: true });
+      fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: '@test/pkg', version: '1.0.0' }));
+
+      const ctx = createContext(dir);
+      const promise = runNpmPublishStage(ctx);
+      await vi.runAllTimersAsync();
+      await promise;
+
+      expect(publishCalls).toBe(2); // one failure + one success
+      expect(ctx.output.npm[0]?.success).toBe(true);
+      expect(ctx.output.npm[0]?.attempts).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('should exhaust retries on a persistent transient error and throw the real error', async () => {
+    vi.useFakeTimers();
+    try {
+      const { execCommand } = await import('../../../src/utils/exec.js');
+      let publishCalls = 0;
+      vi.mocked(execCommand).mockImplementation(async (_file, args) => {
+        if ((args as string[])?.includes('publish')) {
+          publishCalls++;
+          throw Object.assign(new Error('npm ERR! 503 Service Unavailable'), {
+            stdout: '',
+            stderr: 'npm ERR! 503 Service Unavailable',
+            exitCode: 1,
+          });
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+
+      const dir = createTmpDir();
+      const pkgDir = path.join(dir, 'packages', 'pkg');
+      fs.mkdirSync(pkgDir, { recursive: true });
+      fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: '@test/pkg', version: '1.0.0' }));
+
+      const ctx = createContext(dir);
+      const promise = runNpmPublishStage(ctx).catch((e) => e);
+      await vi.runAllTimersAsync();
+      const error = await promise;
+
+      // The final (real) error is surfaced, not a synthetic one.
+      expect(String(error)).toContain('503');
+      expect(publishCalls).toBe(3); // initial + 2 retries
+      expect(ctx.output.npm[0]?.success).toBe(false);
+      // The failed result still records how many attempts were made.
+      expect(ctx.output.npm[0]?.attempts).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('should resolve a retried publish as already-published when the conflict surfaces (no duplicate)', async () => {
+    vi.useFakeTimers();
+    try {
+      const { execCommand } = await import('../../../src/utils/exec.js');
+      let publishCalls = 0;
+      vi.mocked(execCommand).mockImplementation(async (_file, args) => {
+        if ((args as string[])?.includes('publish')) {
+          publishCalls++;
+          if (publishCalls === 1) {
+            // First attempt: transient blip after the publish may have landed.
+            throw Object.assign(new Error('Command failed'), {
+              stdout: '',
+              stderr: 'npm ERR! 503 Service Unavailable',
+              exitCode: 1,
+            });
+          }
+          // Retry sees the version is now present.
+          throw Object.assign(new Error('Command failed'), {
+            stdout: '',
+            stderr:
+              'npm ERR! code EPUBLISHCONFLICT\nnpm ERR! 403 You cannot publish over the previously published versions: 1.0.0.',
+            exitCode: 1,
+          });
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+
+      const dir = createTmpDir();
+      const pkgDir = path.join(dir, 'packages', 'pkg');
+      fs.mkdirSync(pkgDir, { recursive: true });
+      fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: '@test/pkg', version: '1.0.0' }));
+
+      const ctx = createContext(dir);
+      const promise = runNpmPublishStage(ctx);
+      await vi.runAllTimersAsync();
+      await expect(promise).resolves.toBeUndefined();
+
+      expect(publishCalls).toBe(2); // EPUBLISHCONFLICT is not retried further
+      expect(ctx.output.npm[0]?.alreadyPublished).toBe(true);
+      expect(ctx.output.npm[0]?.skipped).toBe(true);
+      expect(ctx.output.npm[0]?.success).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('should skip when npm disabled', async () => {

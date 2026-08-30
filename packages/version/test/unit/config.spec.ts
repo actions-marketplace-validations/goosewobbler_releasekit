@@ -82,26 +82,12 @@ describe('Config', () => {
         path.join(dir, 'releasekit.config.json'),
         JSON.stringify({
           version: {
-            updateInternalDependencies: 'invalid-value',
+            zeroMajor: 'invalid-value',
           },
         }),
       );
 
       expect(() => loadConfig({ cwd: dir })).toThrow();
-    });
-
-    it('should read baseBranch from top-level git.branch', () => {
-      const dir = createTmpDir();
-      fs.writeFileSync(
-        path.join(dir, 'releasekit.config.json'),
-        JSON.stringify({
-          git: { branch: 'develop' },
-          version: { preset: 'angular' },
-        }),
-      );
-
-      const config = loadConfig({ cwd: dir });
-      expect(config.baseBranch).toBe('develop');
     });
   });
 });

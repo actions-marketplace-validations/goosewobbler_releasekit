@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import * as readline from 'node:readline';
-import { loadConfig, saveAuth } from '@releasekit/config';
+import { LLMConfigSchema, loadConfig, saveAuth } from '@releasekit/config';
 import { EXIT_CODES, error, info, setLogLevel, setQuietMode, success, warn } from '@releasekit/core';
 import { Command } from 'commander';
 import { runPipeline } from './core/pipeline.js';
@@ -19,8 +19,7 @@ export function createNotesCommand(): Command {
     .option('--no-changelog', 'Disable changelog generation')
     .option('--changelog-mode <mode>', 'Changelog location mode (root|packages|both)')
     .option('--changelog-file <name>', 'Changelog file name override')
-    .option('--release-notes-mode <mode>', 'Enable release notes and set location (root|packages|both)')
-    .option('--release-notes-file <name>', 'Release notes file name override')
+    .option('--release-notes-dir <dir>', 'Write per-version release-notes files to this directory')
     .option('--no-release-notes', 'Disable release notes generation')
     .option('-t, --template <path>', 'Template file or directory')
     .option('-e, --engine <engine>', 'Template engine (handlebars|liquid|ejs)')
@@ -63,13 +62,11 @@ export function createNotesCommand(): Command {
 
         if (options.releaseNotes === false) {
           config.releaseNotes = false;
-        } else if (options.releaseNotesMode || options.releaseNotesFile) {
+        } else if (options.releaseNotesDir) {
           const existing = config.releaseNotes !== false ? (config.releaseNotes ?? {}) : {};
-          const mode = (options.releaseNotesMode ?? existing.mode ?? 'root') as 'root' | 'packages' | 'both';
           config.releaseNotes = {
             ...existing,
-            mode,
-            ...(options.releaseNotesFile ? { file: options.releaseNotesFile } : {}),
+            file: { dir: options.releaseNotesDir },
           };
         }
 
@@ -113,7 +110,7 @@ export function createNotesCommand(): Command {
             const existingLlm = existingRn.llm;
             const llm = {
               provider: existingLlm?.provider ?? 'openai-compatible',
-              model: existingLlm?.model ?? '',
+              model: existingLlm?.model,
               ...(existingLlm ?? {}),
             };
             if (options.llmProvider) llm.provider = options.llmProvider;
@@ -129,12 +126,28 @@ export function createNotesCommand(): Command {
               };
             }
 
+            // Validate the CLI-assembled LLM config the same way loadConfig validates a config file,
+            // so a bad --llm-provider or a missing --llm-model fails loud here (non-zero exit via
+            // handleError) instead of reaching createProvider and being swallowed by the pipeline's
+            // soft-fail as a silent degradation to non-LLM notes.
+            let validatedLlm: import('./core/types.js').LLMConfig;
+            try {
+              validatedLlm = LLMConfigSchema.parse(llm) as import('./core/types.js').LLMConfig;
+            } catch (err) {
+              // Surface the Zod issue messages, which name the actual failing field (provider enum,
+              // empty/missing model, or missing baseURL for openai-compatible) — a static message
+              // would misattribute e.g. a missing --llm-base-url to the model.
+              const issues = (err as { issues?: Array<{ message: string }> }).issues;
+              const detail =
+                issues?.map((i) => i.message).join('; ') ?? (err instanceof Error ? err.message : String(err));
+              throw new Error(`Invalid LLM configuration from --llm-* flags: ${detail}`);
+            }
             config.releaseNotes = {
               ...existingRn,
-              llm: llm as import('./core/types.js').LLMConfig,
+              llm: validatedLlm,
             };
 
-            info(`LLM configured: ${llm.provider}${llm.model ? ` (${llm.model})` : ''}`);
+            info(`LLM configured: ${validatedLlm.provider}${validatedLlm.model ? ` (${validatedLlm.model})` : ''}`);
             if (llm.baseURL) {
               info(`LLM base URL: ${llm.baseURL}`);
             }
@@ -170,14 +183,10 @@ export function createNotesCommand(): Command {
 
         if (options.monorepo) {
           const monoMode = options.monorepo as 'root' | 'packages' | 'both';
-          config.monorepo = { ...config.monorepo, mode: monoMode };
-          // Wire through to changelog/releaseNotes mode so --monorepo controls file output.
-          // Explicit --changelog-mode / --release-notes-mode take priority if both are set.
+          // Wire --monorepo through to the changelog's location mode. Release notes use a per-version
+          // directory rather than location modes, so they're unaffected.
           if (config.changelog !== false && !options.changelogMode) {
             config.changelog = { ...(config.changelog ?? {}), mode: monoMode };
-          }
-          if (config.releaseNotes !== false && config.releaseNotes !== undefined && !options.releaseNotesMode) {
-            config.releaseNotes = { ...config.releaseNotes, mode: monoMode };
           }
         }
 

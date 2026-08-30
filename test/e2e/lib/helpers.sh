@@ -38,8 +38,7 @@ create_package_json() {
   cat > package.json <<EOF
 {
   "name": "$name",
-  "version": "$version",
-  "private": true
+  "version": "$version"
 }
 EOF
 }
@@ -89,8 +88,14 @@ run_cli_json() {
     cat "$stderrfile" >&2
   fi
 
-  # Output the JSON (stdout only)
-  cat "$tmpfile"
+  # Output the JSON (stdout only). Unwrap the uniform CLI envelope ({ schemaVersion, status, data, … })
+  # to its data payload so callers read result fields (.versionOutput, …) directly. Output that isn't
+  # an envelope — non-JSON, or a command that isn't enveloped yet — passes through unchanged.
+  if jq -e 'type == "object" and has("schemaVersion") and has("data")' "$tmpfile" >/dev/null 2>&1; then
+    jq '.data' "$tmpfile"
+  else
+    cat "$tmpfile"
+  fi
   rm -f "$tmpfile" "$stderrfile"
 
   return $exit_code
@@ -125,4 +130,103 @@ assert_contains() {
     exit 1
   fi
   echo "PASS: Output contains '$needle'"
+}
+
+assert_updated() {
+  local pkg="$1"
+  local json="$2"
+  local count
+  count=$(echo "$json" | jq --arg pkg "$pkg" '[.versionOutput.updates[]? | select(.packageName == $pkg)] | length') || {
+    echo "FAIL: Failed to parse JSON for '$pkg' updates check"
+    exit 1
+  }
+  if [[ "$count" == "0" ]]; then
+    echo "FAIL: Expected '$pkg' to be in updates, but it was not"
+    echo "Updates: $(echo "$json" | jq '.versionOutput.updates')"
+    exit 1
+  fi
+  echo "PASS: '$pkg' is in updates"
+}
+
+assert_not_updated() {
+  local pkg="$1"
+  local json="$2"
+  local count
+  count=$(echo "$json" | jq --arg pkg "$pkg" '[.versionOutput.updates[]? | select(.packageName == $pkg)] | length') || {
+    echo "FAIL: Failed to parse JSON for '$pkg' updates check"
+    exit 1
+  }
+  if [[ "$count" != "0" ]]; then
+    echo "FAIL: Expected '$pkg' NOT to be in updates, but it was"
+    echo "Updates: $(echo "$json" | jq '.versionOutput.updates')"
+    exit 1
+  fi
+  echo "PASS: '$pkg' not in updates"
+}
+
+get_updated_version() {
+  local pkg="$1"
+  local json="$2"
+  echo "$json" | jq -r --arg pkg "$pkg" '.versionOutput.updates[]? | select(.packageName == $pkg) | .newVersion'
+}
+
+get_update_tag() {
+  local pkg="$1"
+  local json="$2"
+  echo "$json" | jq -r --arg pkg "$pkg" '.versionOutput.updates[]? | select(.packageName == $pkg) | .tag // empty'
+}
+
+assert_update_has_tag() {
+  local pkg="$1"
+  local expected_tag="$2"
+  local json="$3"
+  local actual_tag
+  actual_tag=$(get_update_tag "$pkg" "$json")
+  if [[ "$actual_tag" != "$expected_tag" ]]; then
+    echo "FAIL: Expected update tag for '$pkg' to be '$expected_tag', got '${actual_tag:-<absent>}'"
+    exit 1
+  fi
+  echo "PASS: Update for '$pkg' has tag '$actual_tag'"
+}
+
+assert_update_has_no_tag() {
+  local pkg="$1"
+  local json="$2"
+  local actual_tag
+  actual_tag=$(get_update_tag "$pkg" "$json")
+  if [[ -n "$actual_tag" ]]; then
+    echo "FAIL: Expected update for '$pkg' to have no tag, but got '$actual_tag'"
+    exit 1
+  fi
+  echo "PASS: Update for '$pkg' has no tag (batch push mode)"
+}
+
+assert_tag_contains() {
+  local pattern="$1"
+  local json="$2"
+  local found
+  found=$(echo "$json" | jq -r --arg pat "$pattern" '.versionOutput.tags[]? | select(test($pat))' | head -1)
+  if [[ -z "$found" ]]; then
+    echo "FAIL: Expected tags to match pattern '$pattern'"
+    echo "Tags: $(echo "$json" | jq '.versionOutput.tags')"
+    exit 1
+  fi
+  echo "PASS: Tags contain '$found' (matched '$pattern')"
+}
+
+assert_tag_not_contains() {
+  local pattern="$1"
+  local json="$2"
+  local found
+  found=$(echo "$json" | jq -r --arg pat "$pattern" '.versionOutput.tags[]? | select(test($pat))' | head -1)
+  if [[ -n "$found" ]]; then
+    echo "FAIL: Expected tags NOT to match pattern '$pattern', but found '$found'"
+    exit 1
+  fi
+  echo "PASS: Tags do not contain pattern '$pattern'"
+}
+
+get_version_from_json() {
+  local json="$1"
+  echo "$json" | jq -r '.versionOutput.updates[0].newVersion // empty'
 }

@@ -1,7 +1,9 @@
 import { debug, info, success, warn } from '@releasekit/core';
 import type { PipelineContext, VerificationResult } from '../types.js';
+import { CRATES_IO_API_TIMEOUT_MS, CRATES_IO_USER_AGENT } from '../utils/cargo.js';
 import { execCommandSafe } from '../utils/exec.js';
 import { buildViewCommand } from '../utils/package-manager.js';
+import { PUB_DEV_API_TIMEOUT_MS, PUB_DEV_USER_AGENT } from '../utils/pub.js';
 import { withRetry } from '../utils/retry.js';
 
 export async function runVerifyStage(ctx: PipelineContext): Promise<void> {
@@ -73,20 +75,99 @@ export async function runVerifyStage(ctx: PipelineContext): Promise<void> {
       }
 
       try {
-        await withRetry(async () => {
-          result.attempts++;
-          const response = await fetch(`https://crates.io/api/v1/crates/${crate.packageName}/${crate.version}`);
+        await withRetry(
+          async () => {
+            result.attempts++;
+            const response = await fetch(`https://crates.io/api/v1/crates/${crate.packageName}/${crate.version}`, {
+              signal: AbortSignal.timeout(CRATES_IO_API_TIMEOUT_MS),
+              headers: { 'User-Agent': CRATES_IO_USER_AGENT },
+            });
 
-          if (!response.ok) {
-            throw new Error(`${crate.packageName}@${crate.version} not yet available on crates.io`);
-          }
+            if (response.status === 403) {
+              throw Object.assign(
+                new Error(
+                  `crates.io API rejected request for ${crate.packageName}@${crate.version} (403 Forbidden) — check User-Agent policy`,
+                ),
+                { fatal: true },
+              );
+            }
 
-          debug(`Verified ${crate.packageName}@${crate.version} on crates.io`);
-        }, config.verify.cargo);
+            if (!response.ok) {
+              throw new Error(`${crate.packageName}@${crate.version} not yet available on crates.io`);
+            }
+
+            debug(`Verified ${crate.packageName}@${crate.version} on crates.io`);
+          },
+          config.verify.cargo,
+          (error) => !(error instanceof Error && (error as any).fatal),
+        );
         result.verified = true;
         success(`Verified ${crate.packageName}@${crate.version} on crates.io`);
-      } catch {
-        warn(`Failed to verify ${crate.packageName}@${crate.version} on crates.io after ${result.attempts} attempts`);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        warn(
+          `Failed to verify ${crate.packageName}@${crate.version} on crates.io after ${result.attempts} attempts: ${reason}`,
+        );
+      }
+
+      ctx.output.verification.push(result);
+    }
+  }
+
+  // Verify Dart packages on pub.dev
+  if (config.verify.pub.enabled) {
+    const published = output.pub.filter((r) => r.success && !r.skipped && !r.alreadyPublished);
+
+    for (const pkg of published) {
+      const result: VerificationResult = {
+        packageName: pkg.packageName,
+        version: pkg.version,
+        registry: 'pub',
+        verified: false,
+        attempts: 0,
+      };
+
+      if (cliOptions.dryRun) {
+        info(`[DRY RUN] Would verify ${pkg.packageName}@${pkg.version} on pub.dev`);
+        result.verified = true;
+        ctx.output.verification.push(result);
+        continue;
+      }
+
+      try {
+        await withRetry(
+          async () => {
+            result.attempts++;
+            const response = await fetch(`https://pub.dev/api/packages/${pkg.packageName}/versions/${pkg.version}`, {
+              signal: AbortSignal.timeout(PUB_DEV_API_TIMEOUT_MS),
+              headers: { 'User-Agent': PUB_DEV_USER_AGENT },
+            });
+
+            if (response.status === 403) {
+              throw Object.assign(
+                new Error(
+                  `pub.dev API rejected request for ${pkg.packageName}@${pkg.version} (403 Forbidden) — check User-Agent policy`,
+                ),
+                { fatal: true },
+              );
+            }
+
+            if (!response.ok) {
+              throw new Error(`${pkg.packageName}@${pkg.version} not yet available on pub.dev`);
+            }
+
+            debug(`Verified ${pkg.packageName}@${pkg.version} on pub.dev`);
+          },
+          config.verify.pub,
+          (error) => !(error instanceof Error && (error as any).fatal),
+        );
+        result.verified = true;
+        success(`Verified ${pkg.packageName}@${pkg.version} on pub.dev`);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        warn(
+          `Failed to verify ${pkg.packageName}@${pkg.version} on pub.dev after ${result.attempts} attempts: ${reason}`,
+        );
       }
 
       ctx.output.verification.push(result);

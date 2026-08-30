@@ -7,26 +7,45 @@ import * as path from 'node:path';
 import type { Package } from '@manypkg/get-packages';
 import type { VersionChangelogEntry } from '@releasekit/core';
 import { shouldMatchPackageTargets, shouldProcessPackage as shouldProcessPackageUtil } from '@releasekit/core';
+import { syncCargoLockfile } from '../cargo/cargoLock.js';
 import { extractChangelogEntriesFromCommits } from '../changelog/commitParser.js';
 import { BaseVersionError } from '../errors/baseError.js';
+import { StrictReachableError } from '../errors/strictReachableError.js';
 import { createVersionError, VersionErrorCode } from '../errors/versionError.js';
-import { execSync } from '../git/commandExecutor.js';
 import { getLatestTag, getLatestTagForPackage } from '../git/tagsAndBranches.js';
 import { updatePackageVersion } from '../package/packageManagement.js';
 import { PackageProcessor } from '../package/packageProcessor.js';
 import type { Config } from '../types.js';
-import { formatCommitMessage, formatTag, formatVersionPrefix } from '../utils/formatting.js';
-import { addChangelogData, addTag, setCommitMessage } from '../utils/jsonOutput.js';
+import { resolveConfinedManifestPath } from '../utils/confinedPath.js';
+import { deriveBaselineTagPrefix, formatCommitMessage, formatTag, formatVersionPrefix } from '../utils/formatting.js';
+import {
+  addBaselineTag,
+  addChangelogData,
+  addTag,
+  setAllPackageUpdateActions,
+  setAllPackageUpdatePreviousVersions,
+  setCommitMessage,
+  setPackageUpdateAction,
+  setPackageUpdatePreviousVersion,
+  setPackageUpdateTag,
+  setVersioningStrategy,
+} from '../utils/jsonOutput.js';
 import { log } from '../utils/logging.js';
+import { resolveVersionAction } from '../utils/versionAction.js';
+import { BaselineResolver } from './baselineResolver.js';
+import { hasExplicitGroups } from './groupResolution.js';
+import { createGroupStrategy } from './groupStrategy.js';
 import { calculateVersion } from './versionCalculator.js';
 import type { PackagesWithRoot } from './versionEngine.js';
 
 type ChangelogEntry = VersionChangelogEntry;
 
 /**
- * Available strategy types
+ * Available strategy types.
+ * `group` is the version-groups engine (fixed/linked) and the implicit all-packages group that
+ * `version.sync: true` desugars to.
  */
-export type StrategyType = 'sync' | 'single' | 'async';
+export type StrategyType = 'sync' | 'single' | 'async' | 'group';
 
 /**
  * Strategy function type
@@ -47,9 +66,17 @@ function shouldProcessPackage(pkg: Package, config: Config): boolean {
  * @param packageDir - The directory containing the package
  * @param version - The version to update to
  * @param cargoConfig - The cargo configuration from config
+ * @param dryRun - When true, log the intended writes without touching disk
+ * @param repoRoot - Confinement boundary for config-driven `cargo.paths` writes
  * @returns Array of Cargo.toml file paths that were updated
  */
-function updateCargoFiles(packageDir: string, version: string, cargoConfig: Config['cargo'], dryRun = false): string[] {
+function updateCargoFiles(
+  packageDir: string,
+  version: string,
+  cargoConfig: Config['cargo'],
+  dryRun = false,
+  repoRoot: string = process.cwd(),
+): string[] {
   const updatedFiles: string[] = [];
 
   // Check if Cargo.toml handling is enabled (default to true if not specified)
@@ -61,21 +88,29 @@ function updateCargoFiles(packageDir: string, version: string, cargoConfig: Conf
 
   const cargoPaths = cargoConfig?.paths;
 
+  // After rewriting a Cargo.toml version, sync its Cargo.lock self-entry so the committed lock
+  // doesn't drift. The returned lock path is staged alongside the manifest; deduped because
+  // crates in one workspace share a single workspace-root lock.
+  const stageCargo = (cargoTomlPath: string): void => {
+    updatePackageVersion(cargoTomlPath, version, dryRun);
+    updatedFiles.push(cargoTomlPath);
+    const lockPath = syncCargoLockfile(cargoTomlPath, dryRun);
+    if (lockPath && !updatedFiles.includes(lockPath)) updatedFiles.push(lockPath);
+  };
+
   if (cargoPaths && cargoPaths.length > 0) {
     // If paths are specified, only include those Cargo.toml files
     for (const cargoPath of cargoPaths) {
-      const resolvedCargoPath = path.resolve(packageDir, cargoPath, 'Cargo.toml');
+      const resolvedCargoPath = resolveConfinedManifestPath(repoRoot, packageDir, cargoPath, 'Cargo.toml');
       if (fs.existsSync(resolvedCargoPath)) {
-        updatePackageVersion(resolvedCargoPath, version, dryRun);
-        updatedFiles.push(resolvedCargoPath);
+        stageCargo(resolvedCargoPath);
       }
     }
   } else {
     // Default behaviour: check for Cargo.toml in the root package directory
     const cargoTomlPath = path.join(packageDir, 'Cargo.toml');
     if (fs.existsSync(cargoTomlPath)) {
-      updatePackageVersion(cargoTomlPath, version, dryRun);
-      updatedFiles.push(cargoTomlPath);
+      stageCargo(cargoTomlPath);
     }
   }
 
@@ -88,11 +123,10 @@ function updateCargoFiles(packageDir: string, version: string, cargoConfig: Conf
 export function createSyncStrategy(config: Config): StrategyFunction {
   return async (packages: PackagesWithRoot): Promise<void> => {
     try {
+      setVersioningStrategy('sync');
       const {
         versionPrefix,
         tagTemplate,
-        baseBranch,
-        branchPattern,
         commitMessage = `chore: release \${packageName} v\${version}`,
         prereleaseIdentifier,
         dryRun,
@@ -101,7 +135,15 @@ export function createSyncStrategy(config: Config): StrategyFunction {
 
       // Calculate version for root package first
       const formattedPrefix = formatVersionPrefix(versionPrefix || 'v');
-      let latestTag = await getLatestTag();
+
+      // When `baselineTagTemplate` is set the user wants version-bump and changelog logic to
+      // read a separate "baseline" tag (one that stays on the source branch's history) rather
+      // than the consumer-facing `tagTemplate` tag (which a downstream step may force-move
+      // off the branch). Resolve the baseline template's leading prefix so getLatestTag's
+      // semver scan filters to the baseline family.
+      const baselineTagPrefix = deriveBaselineTagPrefix(config.baselineTagTemplate, formattedPrefix, mainPackage);
+
+      let latestTag = await getLatestTag(baselineTagPrefix);
 
       // Capture the repo root before any mainPackage branch can overwrite mainPkgPath.
       // This is used as commitCheckPath so commit counting always spans the full repo.
@@ -143,8 +185,13 @@ export function createSyncStrategy(config: Config): StrategyFunction {
         log(`No valid package path found, using current working directory: ${mainPkgPath}`, 'warning');
       }
 
-      // Try to get package-specific tags for the version source package
-      if (versionSourceName) {
+      // Try to get package-specific tags for the version source package. Skip this entirely
+      // when `baselineTagTemplate` is set — the baseline lookup above is the authoritative
+      // source for the previous release in that mode, and overwriting it with a consumer-facing
+      // tag (which may have been force-moved off the source branch) would re-introduce the
+      // exact unreachable-tag regression baselineTagTemplate exists to fix.
+      let usedPackageSpecificTag = false;
+      if (versionSourceName && !config.baselineTagTemplate) {
         const packageSpecificTag = await getLatestTagForPackage(versionSourceName, formattedPrefix, {
           tagTemplate,
           packageSpecificTags: config.packageSpecificTags,
@@ -152,6 +199,7 @@ export function createSyncStrategy(config: Config): StrategyFunction {
 
         if (packageSpecificTag) {
           latestTag = packageSpecificTag;
+          usedPackageSpecificTag = true;
           log(`Using package-specific tag for ${versionSourceName}: ${latestTag}`, 'debug');
         } else {
           log(`No package-specific tag found for ${versionSourceName}, using global tag: ${latestTag}`, 'debug');
@@ -164,8 +212,6 @@ export function createSyncStrategy(config: Config): StrategyFunction {
       const nextVersion = await calculateVersion(config, {
         latestTag,
         versionPrefix: formattedPrefix,
-        branchPattern,
-        baseBranch,
         prereleaseIdentifier,
         path: versionSourcePath,
         commitCheckPath: repoRoot,
@@ -188,15 +234,29 @@ export function createSyncStrategy(config: Config): StrategyFunction {
         // Check if packages.root is defined before joining paths
         if (packages.root) {
           const rootPkgPath = path.join(packages.root, 'package.json');
-          if (fs.existsSync(rootPkgPath)) {
-            updatePackageVersion(rootPkgPath, nextVersion, dryRun);
+          // npm version handling gates package.json manifests (default true).
+          if (config.npm?.enabled !== false && fs.existsSync(rootPkgPath)) {
+            // Mark as root so consumers (preview, standing PR) can exclude this lockstep
+            // bump from package counts — it isn't a publishable package.
+            updatePackageVersion(rootPkgPath, nextVersion, dryRun, true);
             files.push(rootPkgPath);
             updatedPackages.push('root');
-            processedPaths.add(rootPkgPath);
+          }
+          // Record the root path unconditionally (even when npm is disabled) so the per-package loop
+          // skips it in a single-package repo where packages.root === packages[0].dir — otherwise its
+          // Cargo.toml would be versioned twice (once here, once in the loop).
+          processedPaths.add(rootPkgPath);
 
-            // Handle Cargo.toml files in root
-            const rootCargoFiles = updateCargoFiles(packages.root, nextVersion, config.cargo, dryRun);
-            files.push(...rootCargoFiles);
+          // Root Cargo.toml handling is independent of npm (updateCargoFiles honors cargo.enabled),
+          // so it runs whether or not npm versioning is disabled — matching the per-package loop below.
+          const rootCargoFiles = updateCargoFiles(packages.root, nextVersion, config.cargo, dryRun, repoRoot);
+          files.push(...rootCargoFiles);
+          // Record 'root' when only the root Cargo.toml was versioned (npm disabled, or no root
+          // package.json). In a single-package repo where packages.root === packages[0].dir the loop
+          // skips this path via processedPaths, so without this nothing tracks the write and the empty
+          // updatedPackages triggers the early return below — abandoning the already-written file.
+          if (rootCargoFiles.length > 0 && !updatedPackages.includes('root')) {
+            updatedPackages.push('root');
           }
         } else {
           log('Root package path is undefined, skipping root package.json update', 'warning');
@@ -219,14 +279,31 @@ export function createSyncStrategy(config: Config): StrategyFunction {
           continue;
         }
 
-        updatePackageVersion(packageJsonPath, nextVersion, dryRun);
-        files.push(packageJsonPath);
-        updatedPackages.push(pkg.packageJson.name);
-        processedPaths.add(packageJsonPath);
+        // Skip when npm version handling is opted out, or for pure Rust packages with no package.json.
+        if (config.npm?.enabled === false) {
+          log(`Skipping package.json update for ${pkg.packageJson.name} - npm version handling disabled`, 'debug');
+        } else if (!fs.existsSync(packageJsonPath)) {
+          log(
+            `Skipping package.json update for ${pkg.packageJson.name} - no package.json found (Rust-only package)`,
+            'debug',
+          );
+        } else {
+          updatePackageVersion(packageJsonPath, nextVersion, dryRun);
+          files.push(packageJsonPath);
+          updatedPackages.push(pkg.packageJson.name);
+          processedPaths.add(packageJsonPath);
+        }
 
         // Handle Cargo.toml files for this package
-        const pkgCargoFiles = updateCargoFiles(pkg.dir, nextVersion, config.cargo, dryRun);
+        const pkgCargoFiles = updateCargoFiles(pkg.dir, nextVersion, config.cargo, dryRun, repoRoot);
         files.push(...pkgCargoFiles);
+
+        // Track by name when only the Cargo.toml was updated: a pure-Rust package (no package.json),
+        // or a hybrid package whose package.json write was skipped because npm handling is disabled.
+        // Without this the early return below abandons the already-written Cargo.toml changes.
+        if ((!fs.existsSync(packageJsonPath) || config.npm?.enabled === false) && pkgCargoFiles.length > 0) {
+          updatedPackages.push(pkg.packageJson.name);
+        }
       }
 
       // Log updated packages
@@ -237,49 +314,43 @@ export function createSyncStrategy(config: Config): StrategyFunction {
         return;
       }
 
+      const baselineResolver = new BaselineResolver({
+        versionPrefix: formattedPrefix,
+        tagTemplate,
+        packageSpecificTags: config.packageSpecificTags ?? false,
+        strictReachable: config.strictReachable ?? false,
+        baseRef: config.baseRef,
+      });
+
       // Extract changelog entries from commits
       let changelogEntries: ChangelogEntry[] = [];
       let revisionRange = 'HEAD';
+      let previousVersion: string | null = null;
 
       try {
-        if (latestTag) {
-          try {
-            execSync('git', ['rev-parse', '--verify', latestTag], {
-              cwd: mainPkgPath,
-              stdio: 'ignore',
-            });
-            revisionRange = `${latestTag}..HEAD`;
-          } catch {
-            if (config.strictReachable) {
-              throw new Error(
-                `Cannot generate changelog: tag '${latestTag}' is not reachable from the current commit. ` +
-                  `When strictReachable is enabled, all tags must be reachable. ` +
-                  `To allow fallback to all commits, set strictReachable to false.`,
-              );
-            }
-            log(`Tag ${latestTag} doesn't exist, using all commits for changelog`, 'debug');
-            revisionRange = 'HEAD';
-          }
-        }
+        const baseline = await baselineResolver.resolve({
+          pkgDir: mainPkgPath,
+          latestTag,
+          hasRealTag: latestTag !== '',
+          usedPackageSpecificTag,
+          nextVersion,
+          graduationName: versionSourceName,
+          baselineTagPrefix,
+          formattedPrefix,
+        });
+        revisionRange = baseline.revisionRange;
+        previousVersion = baseline.previousVersion;
 
-        changelogEntries = extractChangelogEntriesFromCommits(mainPkgPath, revisionRange);
+        changelogEntries = await extractChangelogEntriesFromCommits(mainPkgPath, revisionRange);
 
         if (changelogEntries.length === 0) {
-          changelogEntries = [
-            {
-              type: 'changed',
-              description: `Update version to ${nextVersion}`,
-            },
-          ];
+          changelogEntries = [{ type: 'changed', description: `Update version to ${nextVersion}` }];
         }
       } catch (error) {
+        // A strictReachable violation must abort the run, not degrade to a minimal entry.
+        if (error instanceof StrictReachableError) throw error;
         log(`Error extracting changelog entries: ${error instanceof Error ? error.message : String(error)}`, 'warning');
-        changelogEntries = [
-          {
-            type: 'changed',
-            description: `Update version to ${nextVersion}`,
-          },
-        ];
+        changelogEntries = [{ type: 'changed', description: `Update version to ${nextVersion}` }];
       }
 
       // Build the commit message package name from all updated workspace packages.
@@ -321,12 +392,16 @@ export function createSyncStrategy(config: Config): StrategyFunction {
       // In per-package tag mode, emit one changelog entry per workspace package so the
       // notes pipeline can write a CHANGELOG.md to each package directory and the
       // publish pipeline can match tags to the right release notes.
+      // Omit previousVersion when we fell back to all-history: claiming a baseline the
+      // changelog never diffed against produces a self-contradictory "since <tag>" + full log.
+      // previousVersion is resolved by BaselineResolver (null when we fell back to all-history).
+      const displayPrevious = previousVersion;
       if (config.packageSpecificTags && workspaceNames.length > 0) {
         for (const pkgName of workspaceNames) {
           addChangelogData({
             packageName: pkgName,
             version: nextVersion,
-            previousVersion: latestTag || null,
+            previousVersion: displayPrevious,
             revisionRange,
             repoUrl,
             entries: changelogEntries,
@@ -336,7 +411,7 @@ export function createSyncStrategy(config: Config): StrategyFunction {
         addChangelogData({
           packageName: mainPkgName || 'monorepo',
           version: nextVersion,
-          previousVersion: latestTag || null,
+          previousVersion: displayPrevious,
           revisionRange,
           repoUrl,
           entries: changelogEntries,
@@ -379,16 +454,46 @@ export function createSyncStrategy(config: Config): StrategyFunction {
       // (e.g. 'chore: release  v1.0.0' → 'chore: release v1.0.0') and trim edges.
       formattedCommitMessage = formattedCommitMessage.replace(/\s{2,}/g, ' ').trim();
 
-      // Track tags and commit message for JSON output (git ops now handled by publish)
+      // Track tags and commit message for JSON output (git ops now handled by publish).
       for (const tag of nextTags) {
         addTag(tag);
       }
+      // When configured, also emit the baseline tag — this lives at the same release commit
+      // but stays on the source branch's history even if `tagTemplate`'s tag gets moved by a
+      // downstream step. Future getLatestTag() calls find this one when `baselineTagTemplate`
+      // is set. Stored in a separate `baselineTags` field so the publish pipeline can push it
+      // alongside the consumer tags but skip GitHub Release creation for it.
+      const baselineTag = config.baselineTagTemplate
+        ? formatTag(nextVersion, formattedPrefix, mainPkgName, config.baselineTagTemplate, false)
+        : undefined;
+      if (baselineTag) addBaselineTag(baselineTag);
+      const allTags = baselineTag ? [...nextTags, baselineTag] : nextTags;
+      // Link per-package tags back to their update records so the publish pipeline
+      // can push each tag immediately after that package publishes.
+      if (config.packageSpecificTags && workspaceNames.length > 0) {
+        for (let i = 0; i < workspaceNames.length; i++) {
+          const pkgName = workspaceNames[i];
+          const pkgTag = nextTags[i];
+          if (pkgName && pkgTag) setPackageUpdateTag(pkgName, pkgTag);
+        }
+      }
+      // Resolved version action. Every package moves in lockstep to the same nextVersion
+      // against the same latestTag, so the action is identical across the sync unit — record it on
+      // every update record (including the root lockstep bump).
+      const { action: syncAction, reason: syncReason } = resolveVersionAction({
+        hasNoTags: latestTag === '',
+        latestTag,
+        nextVersion,
+      });
+      setAllPackageUpdateActions(syncAction, syncReason);
+      // Every package moved in lockstep from the same baseline, so the prior version is shared.
+      setAllPackageUpdatePreviousVersions(displayPrevious);
       setCommitMessage(formattedCommitMessage);
 
       if (!dryRun) {
-        log(`Version ${nextVersion} prepared (tags: ${nextTags.join(', ')})`, 'success');
+        log(`Version ${nextVersion} prepared (tags: ${allTags.join(', ')})`, 'success');
       } else {
-        log(`Would create tags: ${nextTags.join(', ')}`, 'info');
+        log(`Would create tags: ${allTags.join(', ')}`, 'info');
       }
     } catch (error) {
       if (BaseVersionError.isVersionError(error)) {
@@ -408,6 +513,7 @@ export function createSyncStrategy(config: Config): StrategyFunction {
 export function createSingleStrategy(config: Config): StrategyFunction {
   return async (packages: PackagesWithRoot): Promise<void> => {
     try {
+      setVersioningStrategy('single');
       const {
         mainPackage,
         versionPrefix,
@@ -437,6 +543,7 @@ export function createSingleStrategy(config: Config): StrategyFunction {
       }
 
       const pkgPath = pkg.dir;
+      const repoRoot = packages.root ?? process.cwd();
       const formattedPrefix = formatVersionPrefix(versionPrefix || 'v');
 
       // Try to get the latest tag specific to this package first
@@ -444,6 +551,9 @@ export function createSingleStrategy(config: Config): StrategyFunction {
         tagTemplate,
         packageSpecificTags: config.packageSpecificTags,
       });
+      // Whether the floor tag came from this package's own series — decides which stable-tag
+      // lookup graduation uses (must match latestTag's source).
+      const usedPackageSpecificTag = !!latestTagResult;
 
       // Fallback to global tag if no package-specific tag exists
       if (!latestTagResult) {
@@ -453,6 +563,7 @@ export function createSingleStrategy(config: Config): StrategyFunction {
 
       // At this point, latestTagResult is guaranteed to be a string (possibly empty)
       const latestTag = latestTagResult;
+      const baselineTagPrefix = deriveBaselineTagPrefix(config.baselineTagTemplate, formattedPrefix, packageName);
 
       let nextVersion: string | undefined;
 
@@ -460,8 +571,6 @@ export function createSingleStrategy(config: Config): StrategyFunction {
       nextVersion = await calculateVersion(config, {
         latestTag,
         versionPrefix: formattedPrefix,
-        branchPattern: config.branchPattern,
-        baseBranch: config.baseBranch,
         prereleaseIdentifier: config.prereleaseIdentifier,
         path: pkgPath,
         name: packageName,
@@ -473,60 +582,46 @@ export function createSingleStrategy(config: Config): StrategyFunction {
         return;
       }
 
+      const baselineResolver = new BaselineResolver({
+        versionPrefix: formattedPrefix,
+        tagTemplate,
+        packageSpecificTags: config.packageSpecificTags ?? false,
+        strictReachable: config.strictReachable ?? false,
+        baseRef: config.baseRef,
+      });
+
       // Generate changelog entries from conventional commits
       let changelogEntries: ChangelogEntry[] = [];
       let revisionRange = 'HEAD';
+      let previousVersion: string | null = null;
 
       try {
-        // Extract entries from commits between the latest tag and HEAD
+        const baseline = await baselineResolver.resolve({
+          pkgDir: pkgPath,
+          latestTag,
+          hasRealTag: latestTag !== '',
+          usedPackageSpecificTag,
+          nextVersion,
+          graduationName: packageName,
+          baselineTagPrefix,
+          formattedPrefix,
+        });
+        revisionRange = baseline.revisionRange;
+        previousVersion = baseline.previousVersion;
 
-        // Check if the tag actually exists in the repository
-        if (latestTag) {
-          try {
-            execSync('git', ['rev-parse', '--verify', latestTag], {
-              cwd: pkgPath,
-              stdio: 'ignore',
-            });
-            // Tag exists, get commits since that tag
-            revisionRange = `${latestTag}..HEAD`;
-          } catch {
-            if (config.strictReachable) {
-              throw new Error(
-                `Cannot generate changelog: tag '${latestTag}' is not reachable from the current commit. ` +
-                  `When strictReachable is enabled, all tags must be reachable. ` +
-                  `To allow fallback to all commits, set strictReachable to false.`,
-              );
-            }
-            // Tag doesn't exist, get all commits
-            log(`Tag ${latestTag} doesn't exist, using all commits for changelog`, 'debug');
-            revisionRange = 'HEAD';
-          }
-        } else {
-          // No tag provided, get all commits
-          revisionRange = 'HEAD';
-        }
-
-        changelogEntries = extractChangelogEntriesFromCommits(pkgPath, revisionRange);
+        changelogEntries = await extractChangelogEntriesFromCommits(pkgPath, revisionRange);
 
         // If we have no entries but we're definitely changing versions,
         // add a minimal entry about the version change
         if (changelogEntries.length === 0) {
-          changelogEntries = [
-            {
-              type: 'changed',
-              description: `Update version to ${nextVersion}`,
-            },
-          ];
+          changelogEntries = [{ type: 'changed', description: `Update version to ${nextVersion}` }];
         }
       } catch (error) {
+        // A strictReachable violation must abort the run, not degrade to a minimal entry.
+        if (error instanceof StrictReachableError) throw error;
         log(`Error extracting changelog entries: ${error instanceof Error ? error.message : String(error)}`, 'warning');
         // Fall back to minimal entry
-        changelogEntries = [
-          {
-            type: 'changed',
-            description: `Update version to ${nextVersion}`,
-          },
-        ];
+        changelogEntries = [{ type: 'changed', description: `Update version to ${nextVersion}` }];
       }
 
       // Determine repo URL from package.json or git config
@@ -555,11 +650,12 @@ export function createSingleStrategy(config: Config): StrategyFunction {
         );
       }
 
-      // Track changelog data for JSON output
+      // Track changelog data for JSON output. previousVersion is resolved by BaselineResolver and is
+      // null when we fell back to all-history so the changelog doesn't claim an undiffed baseline.
       addChangelogData({
         packageName,
         version: nextVersion,
-        previousVersion: latestTag || null,
+        previousVersion,
         revisionRange,
         repoUrl: repoUrl || null,
         entries: changelogEntries,
@@ -567,13 +663,23 @@ export function createSingleStrategy(config: Config): StrategyFunction {
 
       // Update package.json
       const packageJsonPath = path.join(pkgPath, 'package.json');
-      updatePackageVersion(packageJsonPath, nextVersion, dryRun);
 
       // Track all files that need to be committed
-      const filesToCommit: string[] = [packageJsonPath];
+      const filesToCommit: string[] = [];
+
+      // Update package.json when npm version handling is enabled (default true) and it exists;
+      // otherwise skip (opted out, or a pure Rust package with no package.json).
+      const npmEnabled = config.npm?.enabled !== false;
+      if (npmEnabled && fs.existsSync(packageJsonPath)) {
+        updatePackageVersion(packageJsonPath, nextVersion, dryRun);
+        filesToCommit.push(packageJsonPath);
+      } else {
+        const reason = !npmEnabled ? 'npm version handling disabled' : 'no package.json found (Rust-only package)';
+        log(`Skipping package.json update for ${packageName} - ${reason}`, 'debug');
+      }
 
       // Handle Cargo.toml files for this package
-      const cargoFiles = updateCargoFiles(pkgPath, nextVersion, config.cargo, dryRun);
+      const cargoFiles = updateCargoFiles(pkgPath, nextVersion, config.cargo, dryRun, repoRoot);
       filesToCommit.push(...cargoFiles);
 
       log(`Updated package ${packageName} to version ${nextVersion}`, 'success');
@@ -583,6 +689,16 @@ export function createSingleStrategy(config: Config): StrategyFunction {
       const commitMsg = formatCommitMessage(commitMessage, nextVersion, packageName);
 
       addTag(tagName);
+      setPackageUpdateTag(packageName, tagName);
+      // Resolved version action. In single mode an empty `latestTag` means no prior tag
+      // (no manifest-fallback synthetic tag here), matching the baseline resolve's `hasRealTag`.
+      const { action: singleAction, reason: singleReason } = resolveVersionAction({
+        hasNoTags: latestTag === '',
+        latestTag,
+        nextVersion,
+      });
+      setPackageUpdateAction(packageName, singleAction, singleReason);
+      setPackageUpdatePreviousVersion(packageName, previousVersion);
       setCommitMessage(commitMsg);
 
       if (!dryRun) {
@@ -622,10 +738,11 @@ export function createAsyncStrategy(config: Config): StrategyFunction {
     fullConfig: config,
     // Extract common version configuration properties
     config: {
-      branchPattern: config.branchPattern || [],
-      baseBranch: config.baseBranch || 'main',
       prereleaseIdentifier: config.prereleaseIdentifier,
       type: config.type,
+      // Without this the per-package resolver always saw strictReachable=false, so the async path
+      // never enforced it — the guard silently no-op'd for per-package repos.
+      strictReachable: config.strictReachable,
     },
   };
 
@@ -633,6 +750,7 @@ export function createAsyncStrategy(config: Config): StrategyFunction {
 
   return async (packages: PackagesWithRoot, targets: string[] = []): Promise<void> => {
     try {
+      setVersioningStrategy('async');
       // Apply additional filtering if targets are specified at runtime
       let packagesToProcess = packages.packages;
       if (targets.length > 0) {
@@ -646,8 +764,9 @@ export function createAsyncStrategy(config: Config): StrategyFunction {
 
       log(`Processing ${packagesToProcess.length} packages`, 'info');
 
-      // 2. Process packages with PackageProcessor
-      const result = await packageProcessor.processPackages(packagesToProcess);
+      // 2. Process packages with PackageProcessor. Pass the discovered workspace root so
+      // config-driven cargo.paths / pub.paths writes are confined to the repository.
+      const result = await packageProcessor.processPackages(packagesToProcess, packages.root ?? process.cwd());
 
       // 3. Report results
       if (result.updatedPackages.length === 0) {
@@ -682,8 +801,13 @@ export function createAsyncStrategy(config: Config): StrategyFunction {
  * The CLI will override this based on resolved packages.
  */
 export function createStrategy(config: Config): StrategyFunction {
+  // `sync: true` takes precedence over explicit groups (back-compat). Explicit `version.groups`
+  // routes through the unified group engine only when sync is off.
   if (config.sync) {
     return createSyncStrategy(config);
+  }
+  if (hasExplicitGroups(config)) {
+    return createGroupStrategy(config);
   }
 
   // Default to async strategy - the CLI will determine the actual strategy
@@ -699,5 +823,6 @@ export function createStrategyMap(config: Config): Record<StrategyType, Strategy
     sync: createSyncStrategy(config),
     single: createSingleStrategy(config),
     async: createAsyncStrategy(config),
+    group: createGroupStrategy(config),
   };
 }

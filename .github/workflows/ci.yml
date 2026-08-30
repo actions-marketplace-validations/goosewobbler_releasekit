@@ -15,7 +15,7 @@ on:
         default: false
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -38,6 +38,24 @@ jobs:
     with:
       os: ubuntu-latest
 
+  lockfile-validation:
+    name: Validate Lockfile
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Validate lockfile
+        run: |
+          doc_count=$(grep -c "^lockfileVersion" pnpm-lock.yaml || echo "0")
+          if [ "$doc_count" != "1" ]; then
+            echo "ERROR: Lockfile has $doc_count documents (expected 1)"
+            exit 1
+          fi
+          echo "Lockfile validated: $doc_count document(s)"
+
   action-test-harness:
     name: Action Test Harness
     needs: [detect-changes, build]
@@ -45,7 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Development Environment
         uses: ./.github/workflows/actions/setup-workspace
@@ -62,6 +80,15 @@ jobs:
       - name: Run action test harness (release)
         run: pnpm test:action:release
 
+      - name: Run backfill test harness
+        run: pnpm test:harness:backfill
+
+      - name: Run multi-registry test harness (npm + cargo)
+        run: pnpm test:harness:multi
+
+      - name: Run multi-registry test harness (npm disabled, cargo only)
+        run: pnpm test:harness:multi-npm-disabled
+
   lint:
     name: Lint
     needs: [detect-changes, build]
@@ -69,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Development Environment
         uses: ./.github/workflows/actions/setup-workspace
@@ -83,6 +110,12 @@ jobs:
       - name: Run lint
         run: pnpm lint
 
+      - name: Check generated JSON schema is up to date
+        run: pnpm schema:check
+
+      - name: Check generated config docs are up to date
+        run: pnpm docs:check
+
   typecheck:
     name: Typecheck
     needs: [detect-changes, build]
@@ -90,7 +123,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Development Environment
         uses: ./.github/workflows/actions/setup-workspace
@@ -108,18 +141,28 @@ jobs:
     name: Unit Tests
     needs: [detect-changes, build]
     if: needs.detect-changes.outputs.has_changes == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['22', '24']
     uses: ./.github/workflows/_ci-unit.reusable.yml
     with:
       os: ubuntu-latest
       cache_key: ${{ needs.build.outputs.cache_key }}
+      node-version: ${{ matrix.node-version }}
 
   integration-tests:
     name: Integration Tests
     needs: [detect-changes, build]
     if: needs.detect-changes.outputs.run_integration == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['22', '24']
     uses: ./.github/workflows/_ci-integration.reusable.yml
     with:
       cache_key: ${{ needs.build.outputs.cache_key }}
+      node-version: ${{ matrix.node-version }}
 
   package-tests:
     name: Package Tests
@@ -150,7 +193,7 @@ jobs:
   ci-status:
     name: CI Status
     if: always()
-    needs: [detect-changes, build, action-test-harness, lint, typecheck, unit-tests, integration-tests, package-tests, e2e-tests]
+    needs: [detect-changes, build, lockfile-validation, action-test-harness, lint, typecheck, unit-tests, integration-tests, package-tests, e2e-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check CI results

@@ -2,16 +2,27 @@ import * as fs from 'node:fs';
 import path from 'node:path';
 import type { Package } from '@manypkg/get-packages';
 import type { VersionChangelogEntry } from '@releasekit/core';
-import { shouldProcessPackage } from '@releasekit/core';
+import { shouldMatchPackageTargets, shouldProcessPackage } from '@releasekit/core';
 import { extractChangelogEntriesFromCommits, extractRepoLevelChangelogEntries } from '../changelog/commitParser.js';
+import { BaselineResolver } from '../core/baselineResolver.js';
 import { calculateVersion } from '../core/versionCalculator.js';
+import { StrictReachableError } from '../errors/strictReachableError.js';
 import { getLatestTagForPackage } from '../git/tagsAndBranches.js';
-import { verifyTag } from '../git/tagVerification.js';
 import type { Config, VersionConfigBase } from '../types.js';
-import { formatCommitMessage, formatTag, formatVersionPrefix } from '../utils/formatting.js';
-import { addChangelogData, addTag, setCommitMessage, setSharedEntries } from '../utils/jsonOutput.js';
+import { resolveConfinedManifestPath } from '../utils/confinedPath.js';
+import { deriveBaselineTagPrefix, formatCommitMessage, formatTag, formatVersionPrefix } from '../utils/formatting.js';
+import {
+  addChangelogData,
+  addTag,
+  setCommitMessage,
+  setPackageUpdateAction,
+  setPackageUpdatePreviousVersion,
+  setPackageUpdateTag,
+  setSharedEntries,
+} from '../utils/jsonOutput.js';
 import { log } from '../utils/logging.js';
 import { getVersionFromManifests } from '../utils/manifestHelpers.js';
+import { resolveVersionAction } from '../utils/versionAction.js';
 import { updatePackageVersion } from './packageManagement.js';
 
 type ChangelogEntry = VersionChangelogEntry;
@@ -61,9 +72,14 @@ export class PackageProcessor {
   }
 
   /**
-   * Process packages based on skip list only (targeting handled at discovery time)
+   * Process packages based on skip list only (targeting handled at discovery time).
+   *
+   * `repoRoot` is the confinement boundary for config-driven manifest writes
+   * (`version.cargo.paths` / `version.pub.paths`): a path escaping it is rejected. It defaults
+   * to `process.cwd()` but callers pass the discovered workspace root when they have it, since the
+   * tool can run from a subdirectory whose cwd is narrower than the repo.
    */
-  async processPackages(packages: Package[]): Promise<ProcessResult> {
+  async processPackages(packages: Package[], repoRoot: string = process.cwd()): Promise<ProcessResult> {
     const tags: string[] = [];
     const updatedPackagesInfo: Array<{ name: string; version: string; path: string }> = [];
 
@@ -96,6 +112,19 @@ export class PackageProcessor {
     // Accumulate repo-level entries across all packages (keyed by type+description to deduplicate)
     const sharedEntriesMap = new Map<string, ChangelogEntry>();
 
+    // BaselineResolver owns the per-package changelog floor (B) and the repo-level shared floor (C),
+    // constructed once per run so the nearest-reachable shared floor is computed a single time
+    // and reused across packages.
+    const baselineResolver = new BaselineResolver({
+      versionPrefix: this.versionPrefix,
+      tagTemplate: this.tagTemplate,
+      packageSpecificTags: this.fullConfig.packageSpecificTags ?? false,
+      strictReachable: this.config.strictReachable ?? false,
+      baseRef: this.fullConfig.baseRef,
+      sharedFloorCwd: process.cwd(),
+      sharedChangelogFloor: this.fullConfig.sharedChangelogFloor,
+    });
+
     for (const pkg of pkgsToConsider) {
       const name = pkg.packageJson.name;
       const pkgPath = pkg.dir;
@@ -104,11 +133,19 @@ export class PackageProcessor {
       // For package-specific tags, we may need to request package-specific version history
       // Try to get the latest tag specific to this package first
       let latestTagResult = '';
+      let hasRealTag = false;
+      // Whether `latestTag` came from this package's own tag series (vs. the global/manifest
+      // fallback below). Decides which stable-tag lookup to use when graduating, since
+      // `packageSpecificTags: true` can still fall back to a global tag for a package without its
+      // own tag history.
+      let usedPackageSpecificTag = false;
       try {
         latestTagResult = await getLatestTagForPackage(name, this.versionPrefix, {
           tagTemplate: this.tagTemplate,
           packageSpecificTags: this.fullConfig.packageSpecificTags,
         });
+        hasRealTag = !!latestTagResult;
+        usedPackageSpecificTag = !!latestTagResult;
       } catch (error) {
         // Log the specific error, but continue with fallback
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -140,6 +177,7 @@ export class PackageProcessor {
             const globalTagResult = await this.getLatestTag();
             if (globalTagResult) {
               latestTagResult = globalTagResult;
+              hasRealTag = true; // Global tag is a real git tag
               log(`Using global tag ${globalTagResult} as fallback for package ${name}`, 'info');
             }
           }
@@ -154,11 +192,10 @@ export class PackageProcessor {
 
       const nextVersion = await calculateVersion(this.fullConfig, {
         latestTag,
+        hasRealTag,
         versionPrefix: formattedPrefix,
         path: pkgPath,
         name,
-        branchPattern: this.config.branchPattern,
-        baseBranch: this.config.baseBranch,
         prereleaseIdentifier: this.config.prereleaseIdentifier,
         type: this.config.type,
       });
@@ -167,51 +204,74 @@ export class PackageProcessor {
         continue; // No version change calculated for this package
       }
 
-      // Generate changelog entries from conventional commits
+      // previousVersion is shown to users in the changelog header — strip the baseline-tag scheme
+      // back to its consumer-facing form so `release/v0.22.0` appears as `v0.22.0`.
+      const baselineTagPrefix = deriveBaselineTagPrefix(this.fullConfig.baselineTagTemplate, formattedPrefix, name);
+
+      // A package with no prior git tag has its changelog computed from the FULL git history,
+      // which in standing-PR mode can push the rendered PR body past GitHub's 65,536-char limit and
+      // fail PR creation with an opaque 422. Surface it loudly with an actionable baseline-tag
+      // suggestion. (baseRef-scoped runs — advisory preview — are bounded to the PR, so skip them.)
+      if (!hasRealTag && !this.fullConfig.baseRef) {
+        const currentVersion = pkg.packageJson.version;
+        const suggestedTag = currentVersion
+          ? formatTag(currentVersion, formattedPrefix, name, this.tagTemplate, this.fullConfig.packageSpecificTags)
+          : undefined;
+        log(
+          `No prior tag found for ${name} — its changelog will include the full git history.` +
+            (suggestedTag
+              ? ` Create a baseline tag to scope it: git tag ${suggestedTag} <release-sha> && git push origin ${suggestedTag}`
+              : ''),
+          'warning',
+        );
+      }
+
+      // Generate changelog entries from conventional commits. The changelog floor (range,
+      // reachability, prerelease→stable graduation) is resolved by BaselineResolver.
       let changelogEntries: ChangelogEntry[] = [];
       let revisionRange = 'HEAD';
+      let previousVersion: string | null = null;
 
       try {
-        // Extract entries from commits between the latest tag and HEAD
-        // If latestTag is empty or doesn't exist, we'll extract from HEAD
+        const baseline = await baselineResolver.resolve({
+          pkgDir: pkgPath,
+          latestTag,
+          hasRealTag,
+          usedPackageSpecificTag,
+          nextVersion,
+          graduationName: name,
+          baselineTagPrefix,
+          formattedPrefix,
+        });
+        revisionRange = baseline.revisionRange;
+        previousVersion = baseline.previousVersion;
 
-        // Check if the tag actually exists in the repository using the new verification utility
-        if (latestTag) {
-          const verification = verifyTag(latestTag, pkgPath);
-          if (verification.exists && verification.reachable) {
-            // Tag exists and is reachable, get commits since that tag
-            revisionRange = `${latestTag}..HEAD`;
-          } else {
-            // Tag doesn't exist or is unreachable
-            if (this.config.strictReachable) {
-              throw new Error(
-                `Cannot generate changelog: tag '${latestTag}' is not reachable from the current commit. ` +
-                  `When strictReachable is enabled, all tags must be reachable. ` +
-                  `To allow fallback to all commits, set strictReachable to false.`,
-              );
-            }
-            log(`Tag ${latestTag} is unreachable (${verification.error}), using all commits for changelog`, 'debug');
-            revisionRange = 'HEAD';
-          }
-        } else {
-          // No tag provided, get all commits
-          revisionRange = 'HEAD';
-        }
+        changelogEntries = await extractChangelogEntriesFromCommits(pkgPath, revisionRange);
 
-        changelogEntries = extractChangelogEntriesFromCommits(pkgPath, revisionRange);
+        // Also extract repo-level commits (those touching no package dir, plus declared shared
+        // packages whose changes belong project-wide). Classify against the FULL discovered
+        // workspace, not the filtered release set (`packages`) — otherwise a commit touching only a
+        // *non-releasing* package's dir touches "no package" and wrongly leaks into the shared block
+        // Falls back to the processing set when the engine didn't populate the workspace
+        // (e.g. a direct PackageProcessor construction in tests).
+        const workspace =
+          this.fullConfig.allWorkspacePackages ?? packages.map((p) => ({ name: p.packageJson.name, dir: p.dir }));
+        const allPackageDirs = workspace.map((p) => p.dir);
+        // Foundational packages whose changes route to repo-level, from config (exact name or glob).
+        // No hardcoded names — a consumer declares its own via `version.sharedPackages`.
+        const sharedPackagePatterns = this.fullConfig.sharedPackages ?? [];
+        const sharedPackageDirs =
+          sharedPackagePatterns.length === 0
+            ? []
+            : workspace.filter((p) => shouldMatchPackageTargets(p.name, sharedPackagePatterns)).map((p) => p.dir);
+        // Bound the repo-level ("shared") entries by the run's nearest-reachable floor when this
+        // package's own range collapsed to full history (untagged / unreachable), so a single
+        // untagged package doesn't flood "Project-wide changes" with the entire history.
+        const sharedRevisionRange = await baselineResolver.sharedFloor(revisionRange);
 
-        // Also extract repo-level commits (those that don't touch any non-shared package directory)
-        // These include CI changes, infrastructure updates, and changes to shared packages (config, core)
-        // that affect all packages
-        const allPackageDirs = packages.map((p) => p.dir);
-        // Define shared packages that should be included in all package changelogs
-        const sharedPackageNames = ['config', 'core', '@releasekit/config', '@releasekit/core'];
-        const sharedPackageDirs = packages
-          .filter((p) => sharedPackageNames.includes(p.packageJson.name))
-          .map((p) => p.dir);
-        const repoLevelEntries = extractRepoLevelChangelogEntries(
+        const repoLevelEntries = await extractRepoLevelChangelogEntries(
           pkgPath,
-          revisionRange,
+          sharedRevisionRange,
           allPackageDirs,
           sharedPackageDirs,
         );
@@ -236,6 +296,8 @@ export class PackageProcessor {
           ];
         }
       } catch (error) {
+        // A strictReachable violation must abort the run, not degrade to a minimal entry.
+        if (error instanceof StrictReachableError) throw error;
         log(`Error extracting changelog entries: ${error instanceof Error ? error.message : String(error)}`, 'warning');
         // Fall back to minimal entry
         changelogEntries = [
@@ -272,11 +334,12 @@ export class PackageProcessor {
         );
       }
 
-      // Track changelog data for JSON output
+      // Track changelog data for JSON output. previousVersion is resolved by BaselineResolver (the
+      // floor tag in consumer-facing display form, null when we fell back to all-history).
       addChangelogData({
         packageName: name,
         version: nextVersion,
-        previousVersion: latestTag || null,
+        previousVersion,
         revisionRange,
         repoUrl: repoUrl || null,
         entries: changelogEntries,
@@ -289,8 +352,9 @@ export class PackageProcessor {
       //       This ensures consistent versioning across language ecosystems.
       const packageJsonPath = path.join(pkgPath, 'package.json');
 
-      // Always update package.json if it exists
-      if (fs.existsSync(packageJsonPath)) {
+      // Update package.json when npm version handling is enabled (default true) and it exists.
+      const npmEnabled = this.fullConfig.npm?.enabled !== false;
+      if (npmEnabled && fs.existsSync(packageJsonPath)) {
         updatePackageVersion(packageJsonPath, nextVersion, this.dryRun);
       }
 
@@ -306,7 +370,7 @@ export class PackageProcessor {
         if (cargoPaths && cargoPaths.length > 0) {
           // If paths are specified, only include those Cargo.toml files
           for (const cargoPath of cargoPaths) {
-            const resolvedCargoPath = path.resolve(pkgPath, cargoPath, 'Cargo.toml');
+            const resolvedCargoPath = resolveConfinedManifestPath(repoRoot, pkgPath, cargoPath, 'Cargo.toml');
             log(`Checking cargo path for ${name}: ${resolvedCargoPath}`, 'debug');
             if (fs.existsSync(resolvedCargoPath)) {
               log(`Found Cargo.toml for ${name} at ${resolvedCargoPath}, updating...`, 'debug');
@@ -330,6 +394,39 @@ export class PackageProcessor {
         log(`Cargo disabled for ${name}`, 'debug');
       }
 
+      // Check if Dart/pubspec.yaml handling is enabled (default to true if not specified)
+      const pubEnabled = this.fullConfig.pub?.enabled !== false;
+      log(`Pub enabled for ${name}: ${pubEnabled}, config: ${JSON.stringify(this.fullConfig.pub)}`, 'debug');
+
+      if (pubEnabled) {
+        const dartPaths = this.fullConfig.pub?.paths;
+        log(`Pub paths config for ${name}: ${JSON.stringify(dartPaths)}`, 'debug');
+
+        if (dartPaths && dartPaths.length > 0) {
+          for (const dartPath of dartPaths) {
+            const resolvedPubspecPath = resolveConfinedManifestPath(repoRoot, pkgPath, dartPath, 'pubspec.yaml');
+            log(`Checking pub path for ${name}: ${resolvedPubspecPath}`, 'debug');
+            if (fs.existsSync(resolvedPubspecPath)) {
+              log(`Found pubspec.yaml for ${name} at ${resolvedPubspecPath}, updating...`, 'debug');
+              updatePackageVersion(resolvedPubspecPath, nextVersion, this.dryRun);
+            } else {
+              log(`pubspec.yaml not found at ${resolvedPubspecPath}`, 'debug');
+            }
+          }
+        } else {
+          const pubspecPath = path.join(pkgPath, 'pubspec.yaml');
+          log(`Checking default pub path for ${name}: ${pubspecPath}`, 'debug');
+          if (fs.existsSync(pubspecPath)) {
+            log(`Found pubspec.yaml for ${name} at ${pubspecPath}, updating...`, 'debug');
+            updatePackageVersion(pubspecPath, nextVersion, this.dryRun);
+          } else {
+            log(`pubspec.yaml not found for ${name} at ${pubspecPath}`, 'debug');
+          }
+        }
+      } else {
+        log(`Pub disabled for ${name}`, 'debug');
+      }
+
       // Create package-specific tag (using the updated formatTag function with package name)
       const packageTag = formatTag(
         nextVersion,
@@ -340,6 +437,12 @@ export class PackageProcessor {
       );
       // Track tag for JSON output (git ops now handled by publish)
       addTag(packageTag);
+      setPackageUpdateTag(name, packageTag);
+      // Resolved version action — derived from the same tag facts the calculator saw.
+      // `hasNoTags` is `!hasRealTag`: a manifest-fallback synthetic tag isn't a real prior tag.
+      const { action, reason } = resolveVersionAction({ hasNoTags: !hasRealTag, latestTag, nextVersion });
+      setPackageUpdateAction(name, action, reason);
+      setPackageUpdatePreviousVersion(name, previousVersion);
       tags.push(packageTag);
 
       if (this.dryRun) {

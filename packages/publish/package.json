@@ -1,6 +1,6 @@
 {
   "name": "@releasekit/publish",
-  "version": "0.12.0",
+  "version": "0.41.2",
   "description": "Publish packages to npm and crates.io with git tagging and GitHub releases",
   "type": "module",
   "module": "./dist/index.js",
@@ -61,23 +61,27 @@
   "dependencies": {
     "chalk": "catalog:",
     "commander": "catalog:",
+    "jsonc-parser": "catalog:",
     "minimatch": "catalog:",
     "semver": "catalog:",
     "smol-toml": "catalog:",
+    "yaml": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",
     "@releasekit/config": "workspace:*",
     "@releasekit/core": "workspace:*",
+    "@releasekit/git": "workspace:*",
     "@types/node": "catalog:",
     "@types/semver": "catalog:",
     "@vitest/coverage-v8": "catalog:",
+    "npm-packlist": "^10.0.4",
     "tsup": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

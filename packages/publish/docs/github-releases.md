@@ -64,7 +64,7 @@ To populate the GitHub Release body with LLM-written prose:
     "releaseNotes": {
       "llm": {
         "provider": "openai",
-        "model": "gpt-4o-mini",
+        "model": "<your-model>",
         "tasks": { "releaseNotes": true }
       }
     }
@@ -81,16 +81,16 @@ The notes step runs first, the LLM generates prose release notes, and the publis
 
 If `body` is `"auto"` (default), LLM release notes are used automatically when available — no extra config needed.
 
-**2. Optionally write release notes to a file** as well:
+**2. Optionally write release notes to in-repo files** as well:
 
 ```json
 {
   "notes": {
     "releaseNotes": {
-      "mode": "root",
+      "file": { "dir": "release-notes" },
       "llm": {
         "provider": "anthropic",
-        "model": "claude-haiku-4-5",
+        "model": "<your-model>",
         "tasks": { "releaseNotes": true }
       }
     }
@@ -98,7 +98,7 @@ If `body` is `"auto"` (default), LLM release notes are used automatically when a
 }
 ```
 
-When `mode` is set, a `RELEASE_NOTES.md` file is written in addition to the GitHub Release being populated.
+When `file.dir` is set, an immutable per-version file is written under that directory (`release-notes/<package>/<version>.md` in a monorepo) in addition to the GitHub Release being populated.
 
 ---
 
@@ -181,6 +181,24 @@ Set `"perPackage": false` to create a single release for the entire repo.
 
 ---
 
+## Excluding Packages from GitHub Releases
+
+Use `skipPackages` to suppress GitHub Release creation for specific packages while still running the full release process (version bump, commit, tag, npm publish) for them. This is useful for internal or utility packages that shouldn't appear in the GitHub Releases UI.
+
+```json
+{
+  "publish": {
+    "githubRelease": {
+      "skipPackages": ["@my-org/internal-utils", "@my-org/build-tools"]
+    }
+  }
+}
+```
+
+Tags are still created for skipped packages — this is required so that changelog range detection works correctly on the next release.
+
+---
+
 ## Full Configuration Reference
 
 ```json
@@ -192,7 +210,8 @@ Set `"perPackage": false` to create a single release for the entire repo.
       "prerelease": "auto",
       "perPackage": true,
       "body": "auto",
-      "titleTemplate": "${packageName}: ${version}"
+      "titleTemplate": "${packageName}: ${version}",
+      "skipPackages": []
     }
   }
 }

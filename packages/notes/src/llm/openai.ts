@@ -1,21 +1,33 @@
+import { debug } from '@releasekit/core';
 import OpenAI from 'openai';
 import type { CompleteOptions } from '../core/types.js';
 import { LLMError } from '../errors/index.js';
+import { extractJsonFromResponse } from '../utils/json.js';
 import { BaseLLMProvider } from './base.js';
-import { LLM_DEFAULTS } from './defaults.js';
+import type { CompleteResult, LLMMessage } from './messages.js';
+import { debugLogMessages } from './messages.js';
+import type { ProviderCapabilities } from './provider.js';
+import { isRetryableProviderError } from './retryable.js';
 
 export interface OpenAIConfig {
   apiKey?: string;
   baseURL?: string;
-  model?: string;
+  model: string;
 }
 
 export class OpenAIProvider extends BaseLLMProvider {
   readonly name = 'openai';
+  readonly capabilities: ProviderCapabilities = {
+    systemRole: true,
+    structuredOutputs: true,
+    toolUse: false,
+    honorsTemperature: true,
+  };
+
   private client: OpenAI;
   private model: string;
 
-  constructor(config: OpenAIConfig = {}) {
+  constructor(config: OpenAIConfig) {
     super();
 
     const apiKey = config.apiKey ?? process.env.OPENAI_API_KEY;
@@ -29,17 +41,35 @@ export class OpenAIProvider extends BaseLLMProvider {
       baseURL: config.baseURL,
     });
 
-    this.model = config.model ?? LLM_DEFAULTS.models.openai;
+    this.model = config.model;
   }
 
-  async complete(prompt: string, options?: CompleteOptions): Promise<string> {
+  async complete(messages: LLMMessage[], options?: CompleteOptions): Promise<CompleteResult> {
+    debugLogMessages(this.name, messages);
+
+    const signal = this.timeoutSignal(options);
     try {
-      const response = await this.client.chat.completions.create({
+      const openaiMessages = messages.map((m) => ({ role: m.role, content: m.content }));
+
+      const requestParams = {
         model: this.model,
-        messages: [{ role: 'user', content: prompt }],
+        messages: openaiMessages,
         max_tokens: this.getMaxTokens(options),
         temperature: this.getTemperature(options),
-      });
+        stream: false as const,
+        ...(options?.schema && {
+          response_format: {
+            type: 'json_schema' as const,
+            json_schema: {
+              name: options.toolName ?? 'release_notes',
+              schema: options.schema as any,
+              strict: true,
+            },
+          },
+        }),
+      };
+
+      const response = await this.client.chat.completions.create(requestParams, { signal });
 
       const content = response.choices[0]?.message?.content;
 
@@ -47,11 +77,28 @@ export class OpenAIProvider extends BaseLLMProvider {
         throw new LLMError('Empty response from OpenAI');
       }
 
-      return content;
+      if (options?.schema) {
+        try {
+          // Strip markdown code fences / preamble first — some models (and openai-compatible
+          // backends) wrap schema-constrained output in a ```json fence rather than returning raw JSON.
+          const structured = JSON.parse(extractJsonFromResponse(content));
+          return { content, structured };
+        } catch (e) {
+          debug(`OpenAI: failed to parse structured response: ${e instanceof Error ? e.message : String(e)}`);
+          return { content };
+        }
+      }
+
+      return { content };
     } catch (error) {
       if (error instanceof LLMError) throw error;
-
-      throw new LLMError(`OpenAI API error: ${error instanceof Error ? error.message : String(error)}`);
+      if (signal.aborted) {
+        throw new LLMError(`OpenAI request timed out after ${this.getTimeout(options)}ms`, { retryable: true });
+      }
+      throw new LLMError(`OpenAI API error: ${error instanceof Error ? error.message : String(error)}`, {
+        cause: error,
+        retryable: isRetryableProviderError(error),
+      });
     }
   }
 }

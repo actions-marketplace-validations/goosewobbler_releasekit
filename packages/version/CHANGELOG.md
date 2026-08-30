@@ -57,6 +57,299 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## [0.20.0] - 2026-05-04
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.19.3...releasekit-version-v0.20.0)
+
+### New
+- **Idempotent publish**: Publish operations now behave idempotently, allowing safe retries.
+
+### Fixed
+- **Security**: Fixed shell injection vulnerability in e2e test runner by using execFileSync instead of exec.
+
+### Changed
+- Updated LLM provider interfaces and improved message handling for better reliability.
+
+## [0.19.3] - 2026-05-01
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.19.2...releasekit-version-v0.19.3)
+
+### Added
+- **publish**: add User-Agent header to crates.io API requests and enhance error handling (#176)
+
+## [0.19.2] - 2026-05-01
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.19.1...releasekit-version-v0.19.2)
+
+### Changed
+- **action**: convert runAction to async and use spawn for child process execution (#175)
+- rework README (#174)
+
+## [0.19.1] - 2026-05-01
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.19.0...releasekit-version-v0.19.1)
+
+### Added
+- **cargo-publish**: implement crates.io API check for crate publication status
+
+## [0.19.0] - 2026-04-30
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.18.0...releasekit-version-v0.19.0)
+
+### Added
+- add support for targeting all packages in release workflow
+- add githubRelease.skipPackages to suppress GitHub releases (#172)
+
+### Changed
+- **deps-dev**: bump @typescript-eslint/parser from 8.58.2 to 8.59.0 in the development-dependencies group (#164)
+
+### Fixed
+- correct manual release version calculation when using scope-based package targeting (#173)
+- pure rust publishing without a package.json (#171)
+
+## [0.18.0] - 2026-04-29
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.17.1...releasekit-notes-v0.18.0)
+
+### Added
+- **release**: implement per-PR evaluation and notification for release gate (#163)
+- release notes editing in standing PR (#160)
+- **release**: batch accumulation controls for standing PR strategy (#161)
+- add runStandingPRMerge functionality and update command (#157)
+- **release**: add standing PR commit status checks (#158)
+- add standing PR configuration and workflow
+- add standing PR functionality (#156)
+- per-package push in non-sync mode (#155)
+
+### Changed
+- add claude code github workflows (#165)
+- **deps**: bump liquidjs from 10.25.5 to 10.25.7 (#162)
+- update CI setup documentation for standing PR workflow
+
+## [0.17.1] - 2026-04-22
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.17.0...releasekit-notes-v0.17.1)
+
+### Added
+- add stable graduation output and logic for release stability (#152)
+
+### Changed
+- **deps-dev**: bump the development-dependencies group across 1 directory with 4 updates (#150)
+- **deps**: bump actions/upload-pages-artifact from 4 to 5 (#149)
+- **deps**: bump pnpm/action-setup from 5 to 6 (#122)
+
+### Fixed
+- **release**: update PR fetching logic to find merged PRs since last release (#154)
+
+## [0.17.0] - 2026-04-17
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.16.1...releasekit-notes-v0.17.0)
+
+### Added
+- **version**: improve support for pure Rust packages (#148)
+
+## [0.16.1] - 2026-04-17
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.16.0...releasekit-notes-v0.16.1)
+
+### Added
+- **publish**: add support for publishing with uncommitted changes (#146)
+
+## [0.16.0] - 2026-04-17
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.15.3...releasekit-notes-v0.16.0)
+
+### Added
+- update bump option to include 'prerelease' type (#145)
+
+## [0.15.3] - 2026-04-17
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.15.2...releasekit-notes-v0.15.3)
+
+### Fixed
+- **action**: disable Git hooks during sync process (#144)
+
+## [0.15.2] - 2026-04-17
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.15.1...releasekit-notes-v0.15.2)
+
+### Added
+- **action**: add support for fetching and syncing remote changes with optional skip-checkout (#143)
+
+## [0.15.1] - 2026-04-17
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.15.0...releasekit-notes-v0.15.1)
+
+### Fixed
+- **action**: exclude userPnpmStore from NODE_PATH to prevent E2BIG errors (#142)
+
+## [0.15.0] - 2026-04-17
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.14.3...releasekit-notes-v0.15.0)
+
+### Added
+- enhance error handling and verbose output in action script (#141)
+
+## [0.14.3] - 2026-04-17
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.14.2...releasekit-version-v0.14.3)
+
+### Added
+- enhance debugging output for ReleaseKit failures
+
+## [0.14.2] - 2026-04-16
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.14.1...releasekit-version-v0.14.2)
+
+### Fixed
+- correct YAML structure for ReleaseKit action run step
+
+## [0.14.1] - 2026-04-16
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.14.0...releasekit-notes-v0.14.1)
+
+### Fixed
+- **release**: allow manual release without target when no PRs are found (#140)
+- **action**: update skip-checkout description formatting in action.yml
+
+## [0.14.0] - 2026-04-16
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.13.13...releasekit-notes-v0.14.0)
+
+### Added
+- add skip-checkout option to ReleaseKit action (#139)
+
+## [0.13.13] - 2026-04-16
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.13.12...releasekit-notes-v0.13.13)
+
+### Fixed
+- **core**: add conditional debug logging based on DEBUG environment var (#138)
+
+## [0.13.12] - 2026-04-16
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.13.11...releasekit-notes-v0.13.12)
+
+### Changed
+- add publish debug (#137)
+
+## [0.13.11] - 2026-04-16
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.13.10...releasekit-notes-v0.13.11)
+
+### Fixed
+- **publish**: ensure reliable publishing from package directory (#136)
+
+## [0.13.10] - 2026-04-16
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.13.9...releasekit-notes-v0.13.10)
+
+### Fixed
+- **version**: implement dynamic tag stripping based on template configuration (#135)
+
+## [0.13.9] - 2026-04-16
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-notes-v0.13.8...releasekit-notes-v0.13.9)
+
+### Changed
+- remove defaultScope handling and enforce target specification (#134)
+
+## [0.13.8] - 2026-04-16
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.13.7...releasekit-version-v0.13.8)
+
+### Fixed
+- **version**: simplify first release handling to return current version directly (#133)
+
+## [0.13.7] - 2026-04-16
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.13.6...releasekit-version-v0.13.7)
+
+### Fixed
+- **version**: improve first release handling to ensure correct version bumping (#132)
+
+## [0.13.6] - 2026-04-15
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.13.5...releasekit-version-v0.13.6)
+
+### Fixed
+- **version**: refine first release condition to respect stableOnly flag (#131)
+
+## [0.13.5] - 2026-04-15
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.13.4...releasekit-version-v0.13.5)
+
+### Added
+- **core**: enable DEBUG environment variable when log level is set to debug
+
+## [0.13.4] - 2026-04-15
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.13.3...releasekit-version-v0.13.4)
+
+### Fixed
+- enhance first release handling in version calculation (#130)
+
+## [0.13.3] - 2026-04-15
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.13.2...releasekit-version-v0.13.3)
+
+### Fixed
+- apply bump for first release when no previous tag exists (#128)
+- apply bump for first release when no previous tag exists
+
+## [0.13.2] - 2026-04-15
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.13.1...releasekit-version-v0.13.2)
+
+### Added
+- **ci**: add lockfile validation step to CI workflow (#127)
+
+## [0.13.1] - 2026-04-15
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.13.0...releasekit-version-v0.13.1)
+
+### Added
+- **action**: add stable input option for prerelease graduation (#126)
+
+## [0.13.0] - 2026-04-15
+
+[Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.12.0...releasekit-version-v0.13.0)
+
+### Added
+- add stable option to release & version commands for prerelease graduation (#125)
+
 ## [0.12.0] - 2026-04-09
 
 [Full Changelog](https://github.com/goosewobbler/releasekit/compare/releasekit-version-v0.11.1...releasekit-version-v0.12.0)

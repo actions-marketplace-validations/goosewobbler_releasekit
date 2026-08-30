@@ -1,8 +1,9 @@
 import { info, success } from '@releasekit/core';
+import { createGitCli } from '@releasekit/git';
 import { createPublishError, PublishError, PublishErrorCode } from '../errors/index.js';
 import type { PipelineContext } from '../types.js';
 import { detectGitPushMethod } from '../utils/auth.js';
-import { execCommand } from '../utils/exec.js';
+import { runGit } from '../utils/git.js';
 
 function toGithubAuthedUrl(remoteUrl: string, token: string): string | undefined {
   // Only rewrite standard GitHub HTTPS URLs.
@@ -18,6 +19,104 @@ function toGithubAuthedUrl(remoteUrl: string, token: string): string | undefined
     return url.toString();
   } catch {
     return undefined;
+  }
+}
+
+export interface PushSetup {
+  remote: string;
+  pushRemote: string;
+  branch?: string;
+}
+
+/**
+ * Prepare push setup (method detection, auth, branch resolution) once to avoid redundant network probes.
+ * Reuse this for all per-package pushes.
+ */
+export async function preparePushSetup(ctx: PipelineContext): Promise<PushSetup | null> {
+  const { config, cwd, output } = ctx;
+
+  if (!config.git.push) return null;
+
+  const { remote } = config.git;
+  const git = createGitCli();
+
+  let pushMethod = config.git.pushMethod;
+  if (pushMethod === 'auto') {
+    try {
+      pushMethod = await detectGitPushMethod(remote, cwd);
+    } catch {
+      pushMethod = 'https';
+    }
+  }
+
+  const httpsToken = config.git.httpsTokenEnv ? process.env[config.git.httpsTokenEnv] : undefined;
+
+  let pushRemote: string = remote;
+  if (pushMethod === 'https' && httpsToken) {
+    const remoteUrl = (await git.remoteUrl(remote, cwd)) ?? '';
+    const authed = toGithubAuthedUrl(remoteUrl, httpsToken);
+    if (authed) pushRemote = authed;
+  }
+
+  let branch: string | undefined;
+  if (output.git.committed) {
+    branch = config.git.branch;
+    if (!branch) {
+      branch = await git.currentBranch(cwd);
+      if (branch === 'HEAD') {
+        throw createPublishError(
+          PublishErrorCode.GIT_PUSH_ERROR,
+          'Cannot push: repository is in a detached HEAD state. Set git.branch in your config or pass --branch <name>.',
+        );
+      }
+    }
+  }
+
+  return { remote, pushRemote, branch };
+}
+
+/**
+ * Push a single package tag and (idempotently) the branch after a package publishes.
+ * Safe to call once per package — branch push is a no-op when already up-to-date.
+ * Pass precomputed setup to avoid redundant method detection and branch resolution.
+ * Error strategy: THROWS.
+ */
+export async function pushPackageTag(tag: string, ctx: PipelineContext, setup?: PushSetup): Promise<void> {
+  const { config, cliOptions, cwd, output } = ctx;
+  const dryRun = cliOptions.dryRun;
+
+  if (!config.git.push) return;
+
+  const git = createGitCli();
+
+  const resolvedSetup =
+    setup ||
+    ((await preparePushSetup(ctx)) ??
+      (() => {
+        throw createPublishError(PublishErrorCode.GIT_PUSH_ERROR, 'Git push disabled');
+      })());
+
+  const { remote, pushRemote, branch } = resolvedSetup;
+
+  // Wrap raw exec failures as GIT_PUSH_ERROR so the failure report labels the stage `git-push`
+  // rather than `unknown` — mirrors runGitPushStage. Without this, a branch push rejected by a
+  // branch ruleset surfaced as "Stage unknown".
+  try {
+    // Push the specific tag ref (carries the underlying commit with it)
+    await runGit(dryRun, `git push ${remote} refs/tags/${tag}`, () =>
+      git.push({ remote: pushRemote, ref: `refs/tags/${tag}`, cwd }),
+    );
+    output.git.tags.push(tag);
+
+    // Push the branch (idempotent — no-op if remote is already up-to-date)
+    if (output.git.committed && branch) {
+      await runGit(dryRun, `git push ${remote} ${branch}`, () => git.push({ remote: pushRemote, ref: branch, cwd }));
+    }
+
+    output.git.pushed = true;
+  } catch (error) {
+    if (error instanceof PublishError) throw error;
+    throw createPublishError(PublishErrorCode.GIT_PUSH_ERROR, error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -37,6 +136,7 @@ export async function runGitPushStage(ctx: PipelineContext): Promise<void> {
   }
 
   const { remote } = config.git;
+  const git = createGitCli();
 
   // Auto-detect push method if needed
   let pushMethod = config.git.pushMethod;
@@ -57,21 +157,25 @@ export async function runGitPushStage(ctx: PipelineContext): Promise<void> {
     // This avoids requiring workflow-specific remote rewriting.
     let pushRemote: string = remote;
     if (pushMethod === 'https' && httpsToken) {
-      const remoteUrlResult = await execCommand('git', ['remote', 'get-url', remote], { cwd, dryRun: false });
-      const authed = toGithubAuthedUrl(remoteUrlResult.stdout.trim(), httpsToken);
+      const remoteUrl = (await git.remoteUrl(remote, cwd)) ?? '';
+      const authed = toGithubAuthedUrl(remoteUrl, httpsToken);
       if (authed) {
         pushRemote = authed;
       }
     }
 
-    // Push commits — branch resolution is deferred to here so a tags-only push
-    // never triggers the detached-HEAD guard unnecessarily.
+    // Push the branch first, then tags. When this runner created the release commit (direct mode),
+    // the branch must land before the tags so a tag never points at a commit absent from the branch
+    // — and a branch rejected by a concurrent push / ruleset aborts before any tag is pushed, rather
+    // than leaving orphan tags on the remote with `git.pushed` false (no GitHub release). Standing-PR
+    // mode sets committed=false (the commit is already on the remote via the merge) and pushes tags
+    // only. Branch resolution is deferred to here so a tags-only push never triggers the detached-HEAD
+    // guard unnecessarily.
     let branch: string | undefined;
     if (output.git.committed) {
       branch = config.git.branch;
       if (!branch) {
-        const revResult = await execCommand('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, dryRun: false });
-        branch = revResult.stdout.trim();
+        branch = await git.currentBranch(cwd);
         if (branch === 'HEAD') {
           throw createPublishError(
             PublishErrorCode.GIT_PUSH_ERROR,
@@ -79,20 +183,12 @@ export async function runGitPushStage(ctx: PipelineContext): Promise<void> {
           );
         }
       }
-      await execCommand('git', ['push', pushRemote, branch], {
-        cwd,
-        dryRun,
-        label: `git push ${remote} ${branch}`,
-      });
+      await runGit(dryRun, `git push ${remote} ${branch}`, () => git.push({ remote: pushRemote, ref: branch, cwd }));
     }
 
     // Push tags
     if (output.git.tags.length > 0) {
-      await execCommand('git', ['push', pushRemote, '--tags'], {
-        cwd,
-        dryRun,
-        label: `git push ${remote} --tags`,
-      });
+      await runGit(dryRun, `git push ${remote} --tags`, () => git.push({ remote: pushRemote, tags: true, cwd }));
     }
 
     ctx.output.git.pushed = true;

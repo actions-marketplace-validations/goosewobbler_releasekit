@@ -1,0 +1,128 @@
+import { exitCodeForError } from '@releasekit/core';
+import { Command } from 'commander';
+import type { StandingPROptions } from '../standing-pr/standing-pr.js';
+import { runStandingPRMerge, runStandingPRPublish, runStandingPRUpdate } from '../standing-pr/standing-pr.js';
+import { publishDidChange } from './changed.js';
+import { emitError, emitResult, failInput } from './emitResult.js';
+
+export function createStandingPRCommand(): Command {
+  const cmd = new Command('standing-pr').description(
+    'Manage the standing release PR (create/update or publish on merge)',
+  );
+
+  const sharedOptions = (c: Command): Command =>
+    c
+      .option('-c, --config <path>', 'Path to config file')
+      .option('--project-dir <path>', 'Project directory', process.cwd())
+      .option('--npm-auth <method>', 'NPM auth method (auto|oidc|token)', 'auto')
+      .option('-j, --json', 'Output results as JSON', false)
+      .option('--output <path>', 'Write the JSON result to a file instead of stdout')
+      .option('-v, --verbose', 'Verbose logging', false)
+      .option('-q, --quiet', 'Suppress non-error output', false);
+
+  sharedOptions(
+    cmd
+      .command('update')
+      .description('Calculate versions, commit to release branch, and create/update the standing PR')
+      .option('-t, --target <packages>', 'Ad-hoc override: release only these packages (comma-separated)')
+      .option(
+        '--include-prerequisites',
+        'With --target, also release the changed internal dependencies (and group members) of the targets',
+        false,
+      )
+      .option(
+        '--reconcile',
+        'Bypass the skip-pattern guard so a post-release reconcile run still updates the standing PR (HEAD is a release commit at that point)',
+        false,
+      ),
+  ).action(async (opts) => {
+    const options: StandingPROptions = {
+      config: opts.config,
+      projectDir: opts.projectDir,
+      npmAuth: opts.npmAuth,
+      json: opts.json,
+      verbose: opts.verbose,
+      quiet: opts.quiet,
+      reconcile: opts.reconcile,
+      target: opts.target,
+      includePrerequisites: opts.includePrerequisites,
+    };
+
+    try {
+      const result = await runStandingPRUpdate(options);
+      emitResult(result, { json: opts.json, output: opts.output, changed: result.action !== 'noop' });
+    } catch (err) {
+      emitError(err, { json: opts.json, output: opts.output });
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(exitCodeForError(err));
+    }
+  });
+
+  sharedOptions(
+    cmd
+      .command('publish')
+      .description('Publish packages from a merged standing release PR (reads manifest from PR comment)')
+      .option(
+        '--pr <number>',
+        'PR number of the merged standing release PR. When omitted, falls back to the pull_request event payload, then to the most recently merged standing PR via the GitHub API',
+      ),
+  ).action(async (opts) => {
+    const options: StandingPROptions = {
+      config: opts.config,
+      projectDir: opts.projectDir,
+      npmAuth: opts.npmAuth,
+      json: opts.json,
+      verbose: opts.verbose,
+      quiet: opts.quiet,
+    };
+
+    let prNumber: number | undefined;
+    if (opts.pr !== undefined) {
+      // Use a strict regex rather than parseInt — the latter silently accepts trailing
+      // non-digit characters ('123abc' → 123), which would mask genuine input errors.
+      const trimmed = String(opts.pr).trim();
+      if (!/^[1-9]\d*$/.test(trimmed)) {
+        failInput(`--pr must be a positive integer (got: ${opts.pr})`, { json: opts.json, output: opts.output });
+      }
+      prNumber = Number.parseInt(trimmed, 10);
+    }
+
+    try {
+      const result = await runStandingPRPublish(options, prNumber);
+      // Read the publish effects, not the manifest's versions — see publishDidChange.
+      emitResult(result, { json: opts.json, output: opts.output, changed: publishDidChange(result) });
+    } catch (err) {
+      emitError(err, { json: opts.json, output: opts.output });
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(exitCodeForError(err));
+    }
+  });
+
+  sharedOptions(
+    cmd
+      .command('merge')
+      .description('Merge the open standing release PR, optionally publishing immediately')
+      .option('--publish', 'Publish packages immediately after merging', false),
+  ).action(async (opts) => {
+    const options: StandingPROptions = {
+      config: opts.config,
+      projectDir: opts.projectDir,
+      npmAuth: opts.npmAuth,
+      json: opts.json,
+      verbose: opts.verbose,
+      quiet: opts.quiet,
+    };
+
+    try {
+      const result = await runStandingPRMerge(options, { publish: opts.publish });
+      // A non-null result means the PR was merged (nothing-to-merge returns null).
+      emitResult(result, { json: opts.json, output: opts.output, changed: result != null });
+    } catch (err) {
+      emitError(err, { json: opts.json, output: opts.output });
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(exitCodeForError(err));
+    }
+  });
+
+  return cmd;
+}

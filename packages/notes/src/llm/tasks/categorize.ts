@@ -1,54 +1,101 @@
 import { warn } from '@releasekit/core';
 import type { ChangelogEntry, LLMCategory } from '../../core/types.js';
-import { extractJsonFromResponse } from '../../utils/json.js';
+import { LLMError } from '../../errors/index.js';
 import type { CategorizeContext, CategorizedEntries, LLMProvider } from '../index.js';
-import { resolvePrompt } from '../prompts.js';
+import type { LLMMessage } from '../messages.js';
+import { resolveSystemPrompt } from '../prompts.js';
+import { buildCategorizeSchema, CategorizeOutputSchema } from '../schemas.js';
 import { getAllowedScopesFromCategories, validateEntryScopes } from '../scopes.js';
+import {
+  buildCategorySection,
+  checkCategoryNames,
+  groupByCategory,
+  INSTRUCTION_HIERARCHY,
+  parseLLMResult,
+  renderEntries,
+  renderScopeInstruction,
+  runCorrectiveTask,
+  type TaskValidator,
+} from './shared.js';
 
-const DEFAULT_CATEGORIZE_PROMPT = `You are categorizing changelog entries for a software release.
+export function buildSystemPrompt(categories: LLMCategory[] | undefined): string {
+  const categorySection = buildCategorySection(
+    categories,
+    `Categories: Group into meaningful categories (e.g., "Core", "UI", "API", "Performance", "Bug Fixes", "Documentation").`,
+  );
 
-Given the following entries, group them into meaningful categories (e.g., "Core", "UI", "API", "Performance", "Bug Fixes", "Documentation").
-
-Output a JSON object where keys are category names and values are arrays of entry indices (0-based).
-
-Entries:
-{{entries}}
-
-Output only valid JSON, nothing else:`;
-
-function buildCustomCategorizePrompt(categories: LLMCategory[]): string {
-  const categoryList = categories
-    .map((c) => {
-      const scopeInfo = c.scopes?.length ? ` Allowed scopes: ${c.scopes.join(', ')}.` : '';
-      return `- "${c.name}": ${c.description}${scopeInfo}`;
-    })
-    .join('\n');
-
-  const scopeMap = getAllowedScopesFromCategories(categories);
-  let scopeInstructions = '';
-  if (scopeMap.size > 0) {
-    const entries: string[] = [];
-    for (const [catName, scopes] of scopeMap) {
-      entries.push(`For "${catName}", assign a scope from: ${scopes.join(', ')}.`);
-    }
-    scopeInstructions = `\n\n${entries.join('\n')}\nOnly use scopes from these predefined lists. If an entry does not fit any scope, set scope to null.`;
-  }
+  // Scope source: explicit category `scopes` arrays via getAllowedScopesFromCategories.
+  const pairs =
+    categories && categories.length > 0
+      ? [...getAllowedScopesFromCategories(categories)].map(([name, scopes]) => ({ name, scopes }))
+      : [];
+  const scopeInstruction = renderScopeInstruction(pairs, '');
 
   return `You are categorizing changelog entries for a software release.
 
-Given the following entries, group them into the specified categories. Only use the categories listed below in this exact order:
+${INSTRUCTION_HIERARCHY}
 
-Categories:
-${categoryList}${scopeInstructions}
+${categorySection}${scopeInstruction}
 
-Output a JSON object with two fields:
-- "categories": an object where keys are category names and values are arrays of entry indices (0-based)
-- "scopes": an object where keys are entry indices (as strings) and values are scope labels. Only include entries that have a valid scope from the predefined list.
+Output a JSON object with an "entries" array. Each element (same order as input) must have:
+- "category": category name from the list above
+- "scope": subcategory label or null`;
+}
 
-Entries:
-{{entries}}
+function buildUserPrompt(entries: ChangelogEntry[]): string {
+  return `Entries:\n${renderEntries(entries)}`;
+}
 
-Output only valid JSON, nothing else:`;
+export function createCategorizeValidator(
+  entries: ChangelogEntry[],
+  context: CategorizeContext,
+): TaskValidator<CategorizedEntries[]> {
+  // Work with a copy that has scopes cleared (LLM assigns them fresh)
+  const cleanEntries = entries.map((e) => ({ ...e, scope: undefined }));
+
+  return (result) => {
+    const parsed = parseLLMResult(result);
+    if (!parsed.ok) return { valid: false, error: parsed.error };
+
+    const zodResult = CategorizeOutputSchema.safeParse(parsed.data);
+    if (!zodResult.success) {
+      return { valid: false, error: `Schema error: ${zodResult.error.message}` };
+    }
+
+    if (zodResult.data.entries.length !== entries.length) {
+      return {
+        valid: false,
+        error: `Expected ${entries.length} entries, got ${zodResult.data.entries.length}`,
+      };
+    }
+
+    // Validate category names when categories are configured
+    const categoryError = checkCategoryNames(
+      zodResult.data.entries,
+      context.categories?.map((c) => c.name),
+    );
+    if (categoryError) return { valid: false, error: categoryError };
+
+    // Apply scopes from LLM response
+    const withScopes: ChangelogEntry[] = cleanEntries.map((entry, i) => {
+      const llmEntry = zodResult.data.entries[i];
+      const scope = llmEntry?.scope ?? undefined;
+      return scope ? { ...entry, scope } : entry;
+    });
+
+    // Validate scopes. The validator applies `invalidScopeAction` (default `remove`) and
+    // returns `valid: true` — scope mismatches don't trigger an LLM retry, since the configured
+    // action defines the resolution. Surface a warning so disallowed scopes stay visible.
+    const scopeResult = validateEntryScopes(withScopes, context.scopes, context.categories, context.packageNames);
+    if (scopeResult.errors.length > 0) {
+      const offenders = [...new Set(scopeResult.errors.map((e) => e.providedScope))];
+      warn(
+        `LLM returned ${scopeResult.errors.length} entries with disallowed scopes (${offenders.join(', ')}); resolved per invalidScopeAction.`,
+      );
+    }
+
+    return { valid: true, value: groupByCategory(zodResult.data.entries, scopeResult.entries) };
+  };
 }
 
 export async function categorizeEntries(
@@ -60,71 +107,31 @@ export async function categorizeEntries(
     return [];
   }
 
-  // Create a copy of entries with scopes cleared for LLM processing
-  const entriesCopy: ChangelogEntry[] = entries.map((e) => ({ ...e, scope: undefined }));
+  const systemPrompt = resolveSystemPrompt('categorize', buildSystemPrompt(context.categories), context.prompts);
 
-  const entriesText = entriesCopy.map((e, i) => `${i}. [${e.type}]: ${e.description}`).join('\n');
-
-  const hasCustomCategories = context.categories && context.categories.length > 0;
-  const defaultPrompt = hasCustomCategories
-    ? buildCustomCategorizePrompt(context.categories as LLMCategory[])
-    : DEFAULT_CATEGORIZE_PROMPT;
-
-  const promptTemplate = resolvePrompt('categorize', defaultPrompt, context.prompts);
-  const prompt = promptTemplate.replace('{{entries}}', entriesText);
+  const initialMessages: LLMMessage[] = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: buildUserPrompt(entries) },
+  ];
 
   try {
-    const response = await provider.complete(prompt);
-
-    const parsed = JSON.parse(extractJsonFromResponse(response));
-
-    const result: CategorizedEntries[] = [];
-
-    if (hasCustomCategories && parsed.categories) {
-      // Custom categories format: { categories: { ... }, scopes: { ... } }
-      const categoryMap = parsed.categories as Record<string, unknown>;
-      const scopeMap = (parsed.scopes || {}) as Record<string, string>;
-
-      // Apply scopes to entries (only if LLM provided a valid scope)
-      for (const [indexStr, scope] of Object.entries(scopeMap)) {
-        const idx = Number.parseInt(indexStr, 10);
-        if (entriesCopy[idx] && scope?.trim()) {
-          entriesCopy[idx] = { ...entriesCopy[idx], scope: scope.trim() };
-        }
-      }
-
-      // Post-process: validate scopes against config
-      const validatedEntries = validateEntryScopes(entriesCopy, context.scopes, context.categories);
-
-      for (const [category, rawIndices] of Object.entries(categoryMap)) {
-        const indices = Array.isArray(rawIndices) ? rawIndices : [];
-        const categoryEntries = indices
-          .map((i) => validatedEntries[i])
-          .filter((e): e is ChangelogEntry => e !== undefined);
-
-        if (categoryEntries.length > 0) {
-          result.push({ category, entries: categoryEntries });
-        }
-      }
-    } else {
-      // Default format: { "Category": [0, 1, 2] }
-      const categoryMap = parsed as Record<string, unknown>;
-
-      for (const [category, rawIndices] of Object.entries(categoryMap)) {
-        const indices = Array.isArray(rawIndices) ? rawIndices : [];
-        const categoryEntries = indices.map((i) => entriesCopy[i]).filter((e): e is ChangelogEntry => e !== undefined);
-
-        if (categoryEntries.length > 0) {
-          result.push({ category, entries: categoryEntries });
-        }
-      }
-    }
-
-    return result;
+    return await runCorrectiveTask({
+      provider,
+      initialMessages,
+      schema: buildCategorizeSchema(context.categories ?? []),
+      toolName: 'categorize_entries',
+      validate: createCategorizeValidator(entries, context),
+    });
   } catch (error) {
-    warn(
-      `LLM categorization failed, falling back to General: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return [{ category: 'General', entries: entriesCopy }];
+    if (error instanceof LLMError) {
+      warn(`categorizeEntries failed after all attempts: ${error.message}. Returning entries under General.`);
+      // Triggered by structural validation failures the LLM couldn't recover from across the
+      // retry budget: malformed JSON, schema-incompatible output, wrong entry count, or
+      // categories outside the configured list. (Disallowed scopes don't reach here — the
+      // configured invalidScopeAction resolves them in-place.) Strip scopes since the LLM
+      // run never produced validated values.
+      return [{ category: 'General', entries: entries.map((e) => ({ ...e, scope: undefined })) }];
+    }
+    throw error;
   }
 }

@@ -64,7 +64,8 @@ describe('Pipeline: version output → markdown', () => {
     expect(markdown).toContain('### Added');
     expect(markdown).toContain('- **api**: Add streaming support');
     expect(markdown).toContain('### Fixed');
-    expect(markdown).toContain('- Null pointer in parser (#88)');
+    // Bare `#88` is rendered as a canonical Markdown link by default (link mode).
+    expect(markdown).toContain('- Null pointer in parser ([#88](https://github.com/acme/my-lib/issues/88))');
     expect(markdown).toContain('### Changed');
     expect(markdown).toContain('- Simplify config loading');
   });
@@ -164,6 +165,39 @@ describe('compareUrl: platform detection', () => {
     );
   });
 
+  it('should generate compare URL for sanitized "@v" package-specific tags', () => {
+    // formatTag strips "@scope/" -> "scope-name", so a `${packageName}@v${version}` template
+    // yields "zubridge-electron@v3.0.0". The raw "@zubridge/electron" never appears in the tag,
+    // so the `to` ref must be derived from the tag's own prefix, not the package name.
+    const ctx = createTemplateContext({
+      packageName: '@zubridge/electron',
+      version: '3.1.0',
+      previousVersion: 'zubridge-electron@v3.0.0',
+      revisionRange: 'zubridge-electron@v3.0.0..HEAD',
+      repoUrl: 'https://github.com/goosewobbler/zubridge',
+      date: '2026-01-01',
+      entries: [],
+    });
+    expect(ctx.compareUrl).toBe(
+      'https://github.com/goosewobbler/zubridge/compare/zubridge-electron@v3.0.0...zubridge-electron@v3.1.0',
+    );
+  });
+
+  it('should generate compare URL for sanitized "@v" tags across a prerelease escalation', () => {
+    const ctx = createTemplateContext({
+      packageName: '@zubridge/tauri',
+      version: '2.0.0-next.0',
+      previousVersion: 'zubridge-tauri@v1.1.1-next.1',
+      revisionRange: 'zubridge-tauri@v1.1.1-next.1..HEAD',
+      repoUrl: 'https://github.com/goosewobbler/zubridge',
+      date: '2026-01-01',
+      entries: [],
+    });
+    expect(ctx.compareUrl).toBe(
+      'https://github.com/goosewobbler/zubridge/compare/zubridge-tauri@v1.1.1-next.1...zubridge-tauri@v2.0.0-next.0',
+    );
+  });
+
   it('should omit compareUrl when no previousVersion', () => {
     const ctx = createTemplateContext({
       packageName: 'pkg',
@@ -221,6 +255,16 @@ describe('Parser: conventional-changelog', () => {
     const result = parseConventionalChangelog(sampleChangelog, 'my-lib');
     const fixedEntry = result.packages[0]?.entries.find((e) => e.type === 'fixed');
     expect(fixedEntry?.issueIds).toContain('#38');
+  });
+
+  it('should NOT label a trailing (#N) as the PR when parsing existing changelog text', () => {
+    const result = parseConventionalChangelog(sampleChangelog, 'my-lib');
+    // `- **api**: Batch operations (#42)` — in an existing/external changelog a trailing (#42) is
+    // ambiguous (could be an issue), and there's no commit signal, so prNumber is not inferred here.
+    // It still lands in issueIds as a generic ref. PR detection only happens in the commit parsers.
+    const apiEntry = result.packages[0]?.entries.find((e) => e.scope === 'api');
+    expect(apiEntry?.prNumber).toBeUndefined();
+    expect(apiEntry?.issueIds).toContain('#42');
   });
 
   it('should round-trip: parse → render → contains version', () => {
@@ -319,8 +363,10 @@ describe('Monorepo: aggregation and splitting', () => {
   });
 
   it('should include package name in formatVersion only when requested', () => {
-    const withName = formatVersion(pkgA, { includePackageName: true });
-    const withoutName = formatVersion(pkgA);
+    // firstRelease disabled to isolate the includePackageName behaviour from the first-release intro,
+    // whose line legitimately names the package.
+    const withName = formatVersion(pkgA, { includePackageName: true, firstRelease: false });
+    const withoutName = formatVersion(pkgA, { firstRelease: false });
 
     expect(withName).toContain('## @acme/core@1.0.0');
     expect(withoutName).toContain('## 1.0.0');

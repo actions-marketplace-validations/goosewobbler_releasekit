@@ -2,6 +2,7 @@ import { loadAuth } from '../core/config.js';
 import type { ChangelogEntry, LLMCategory, LLMConfig, LLMPromptsConfig, ScopeConfig } from '../core/types.js';
 import { LLMError } from '../errors/index.js';
 import { AnthropicProvider } from './anthropic.js';
+import type { Example } from './examples/types.js';
 import { OllamaProvider } from './ollama.js';
 import { OpenAIProvider } from './openai.js';
 import { OpenAICompatibleProvider } from './openai-compatible.js';
@@ -9,10 +10,11 @@ import type { LLMProvider } from './provider.js';
 
 export { AnthropicProvider } from './anthropic.js';
 export { BaseLLMProvider } from './base.js';
+export type { CompleteResult, LLMMessage } from './messages.js';
 export { OllamaProvider } from './ollama.js';
 export { OpenAIProvider } from './openai.js';
 export { OpenAICompatibleProvider } from './openai-compatible.js';
-export type { LLMProvider } from './provider.js';
+export type { LLMProvider, ProviderCapabilities } from './provider.js';
 export { categorizeEntries } from './tasks/categorize.js';
 export { enhanceEntries, enhanceEntry } from './tasks/enhance.js';
 export { enhanceAndCategorize } from './tasks/enhance-and-categorize.js';
@@ -23,11 +25,16 @@ export interface LLMContext {
   packageName?: string;
   version?: string;
   previousVersion?: string;
+  /** Workspace package names — the allow-list for `scopes.mode: 'packages'` scope validation. */
+  packageNames?: string[];
 }
+
+export type { Example } from './examples/types.js';
 
 export interface EnhanceContext extends LLMContext {
   style?: string;
   prompts?: LLMPromptsConfig;
+  examples?: Example[];
 }
 
 export interface SummarizeContext extends LLMContext {
@@ -43,6 +50,7 @@ export interface CategorizeContext extends LLMContext {
 export interface ReleaseNotesContext extends LLMContext {
   date?: string;
   prompts?: LLMPromptsConfig;
+  examples?: Example[];
 }
 
 export interface CategorizedEntries {
@@ -51,6 +59,14 @@ export interface CategorizedEntries {
 }
 
 export function createProvider(config: LLMConfig): LLMProvider {
+  // releasekit ships no default model (they rot), so a model is required. The Zod schema enforces
+  // this at config load; this guard also covers configs assembled in-process (e.g. the CLI's
+  // --llm-* flags, which bypass schema parsing) so a missing model fails loud, not silently.
+  if (!config.model) {
+    throw new LLMError(
+      `llm.model is required for the '${config.provider}' provider — set it to a model the provider serves.`,
+    );
+  }
   // Resolve API key: explicit config → auth.json → environment (handled per-provider)
   const authKeys = loadAuth();
   const apiKey = config.apiKey ?? authKeys[config.provider];

@@ -6,7 +6,9 @@ import * as cargoHandler from '../../../src/cargo/cargoHandler.js';
 import * as commitParser from '../../../src/changelog/commitParser.js';
 import * as calculator from '../../../src/core/versionCalculator.js';
 import * as versionCalculatorModule from '../../../src/core/versionCalculator.js';
+import { StrictReachableError } from '../../../src/errors/strictReachableError.js';
 import * as gitTags from '../../../src/git/tagsAndBranches.js';
+import * as tagVerification from '../../../src/git/tagVerification.js';
 import * as packageManagement from '../../../src/package/packageManagement.js';
 import { PackageProcessor } from '../../../src/package/packageProcessor.js';
 import type { Config } from '../../../src/types.js';
@@ -20,6 +22,7 @@ vi.mock('node:path');
 vi.mock('node:process');
 vi.mock('../../../src/package/packageManagement.js');
 vi.mock('../../../src/git/tagsAndBranches.js');
+vi.mock('../../../src/git/tagVerification.js');
 vi.mock('../../../src/utils/logging.js');
 vi.mock('../../../src/utils/formatting.js', () => ({
   formatVersionPrefix: vi.fn().mockReturnValue('v'),
@@ -31,6 +34,11 @@ vi.mock('../../../src/utils/formatting.js', () => ({
     return template.replace('${version}', version);
   }),
   escapeRegExp: vi.fn().mockImplementation((str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+  deriveBaselineTagPrefix: vi.fn().mockReturnValue(undefined),
+  displayTag: vi.fn().mockImplementation((tag, baselineTagPrefix, formattedPrefix) => {
+    if (!baselineTagPrefix || !tag.startsWith(baselineTagPrefix)) return tag;
+    return `${formattedPrefix}${tag.slice(baselineTagPrefix.length)}`;
+  }),
 }));
 vi.mock('../../../src/utils/jsonOutput.js');
 vi.mock('../../../src/utils/manifestHelpers.js', () => ({
@@ -108,13 +116,10 @@ describe('Package Processor', () => {
   // Mock config
   const mockConfig: Config = {
     sync: false,
-    updateInternalDependencies: 'patch',
     preset: 'conventional',
     versionPrefix: 'v',
     tagTemplate: '${prefix}${version}',
-    baseBranch: 'main',
     packages: [],
-    branchPattern: ['feature/*'],
     commitMessage: 'chore(release): version ${version}',
   };
 
@@ -129,8 +134,6 @@ describe('Package Processor', () => {
     dryRun: false,
     getLatestTag: mockGetLatestTag,
     config: {
-      branchPattern: ['feature/*'],
-      baseBranch: 'main',
       prereleaseIdentifier: undefined,
       type: undefined,
     },
@@ -143,6 +146,10 @@ describe('Package Processor', () => {
 
     // Path mock
     vi.spyOn(path, 'join').mockImplementation((...args) => args.join('/'));
+
+    // Baseline tag verification — default to a valid, reachable baseline so changelog ranges
+    // resolve to `<tag>..HEAD`. Tests exercising the all-history fallback override this.
+    vi.spyOn(tagVerification, 'verifyTag').mockResolvedValue({ exists: true, reachable: true });
 
     // Calculator mock - fix to return a Promise
     vi.spyOn(calculator, 'calculateVersion').mockResolvedValue('1.1.0');
@@ -340,6 +347,7 @@ describe('Package Processor', () => {
 
       // Should track the tag via JSON output (git ops now handled by publish)
       expect(jsonOutput.addTag).toHaveBeenCalledWith('v1.1.0');
+      expect(jsonOutput.setPackageUpdateTag).toHaveBeenCalledWith('package-a', 'v1.1.0');
 
       // Should return the updated package info
       expect(result.updatedPackages).toEqual([
@@ -368,6 +376,325 @@ describe('Package Processor', () => {
       expect(result.updatedPackages[1].name).toBe('package-b');
     });
 
+    it('should strip baseline tag prefix from previousVersion passed to addChangelogData', async () => {
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('release/v1.0.0');
+      vi.spyOn(formatting, 'deriveBaselineTagPrefix').mockReturnValue('release/v');
+      vi.spyOn(formatting, 'displayTag').mockImplementation((tag, baselineTagPrefix, formattedPrefix) => {
+        if (!baselineTagPrefix || !tag.startsWith(baselineTagPrefix)) return tag;
+        return `${formattedPrefix}${tag.slice(baselineTagPrefix.length)}`;
+      });
+
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        fullConfig: {
+          ...mockConfig,
+          baselineTagTemplate: 'release/${' + 'prefix}${' + 'version}',
+          writeChangelog: false,
+        },
+      });
+
+      await processor.processPackages([mockPackages[0]]);
+
+      const calls = vi.mocked(jsonOutput.addChangelogData).mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls[0][0]).toMatchObject({ previousVersion: 'v1.0.0' });
+    });
+
+    it('should record the resolved previousVersion on the package update', async () => {
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('release/v1.0.0');
+      vi.spyOn(formatting, 'deriveBaselineTagPrefix').mockReturnValue('release/v');
+      vi.spyOn(formatting, 'displayTag').mockImplementation((tag, baselineTagPrefix, formattedPrefix) => {
+        if (!baselineTagPrefix || !tag.startsWith(baselineTagPrefix)) return tag;
+        return `${formattedPrefix}${tag.slice(baselineTagPrefix.length)}`;
+      });
+
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        fullConfig: {
+          ...mockConfig,
+          baselineTagTemplate: 'release/${' + 'prefix}${' + 'version}',
+          writeChangelog: false,
+        },
+      });
+
+      await processor.processPackages([mockPackages[0]]);
+
+      // The update carries the same baseline the changelog does — in consumer-facing display form.
+      expect(jsonOutput.setPackageUpdatePreviousVersion).toHaveBeenCalledWith('package-a', 'v1.0.0');
+    });
+
+    it('should warn and omit previousVersion when the baseline tag is unreachable', async () => {
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('release/v1.0.0');
+      vi.spyOn(formatting, 'deriveBaselineTagPrefix').mockReturnValue('release/v');
+      vi.spyOn(formatting, 'displayTag').mockImplementation((tag, baselineTagPrefix, formattedPrefix) => {
+        if (!baselineTagPrefix || !tag.startsWith(baselineTagPrefix)) return tag;
+        return `${formattedPrefix}${tag.slice(baselineTagPrefix.length)}`;
+      });
+      // Baseline resolves as a ref but can't be verified from HEAD (shallow clone / unpushed tag).
+      vi.spyOn(tagVerification, 'verifyTag').mockResolvedValue({ exists: false, reachable: false, error: 'not found' });
+
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        fullConfig: {
+          ...mockConfig,
+          baselineTagTemplate: 'release/${' + 'prefix}${' + 'version}',
+          writeChangelog: false,
+        },
+      });
+
+      await processor.processPackages([mockPackages[0]]);
+
+      // Surfaced loudly (not a silent debug line)...
+      expect(logging.log).toHaveBeenCalledWith(expect.stringContaining('could not be verified from HEAD'), 'warning');
+      // ...all-history range, and previousVersion omitted so the changelog doesn't claim an undiffed baseline.
+      const calls = vi.mocked(jsonOutput.addChangelogData).mock.calls;
+      expect(calls[0][0]).toMatchObject({ previousVersion: null, revisionRange: 'HEAD' });
+    });
+
+    it('should aggregate the changelog from the last stable tag when a prerelease graduates', async () => {
+      // latestTag is a prerelease; releasing stable 1.1.0 must base the range and previousVersion on
+      // the last *stable* tag, not the prerelease (which holds only the release-prep commit).
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('package-a@v1.1.0-next.0');
+      vi.spyOn(gitTags, 'getLatestStableTagForPackage').mockResolvedValue('package-a@v1.0.0');
+      vi.spyOn(formatting, 'displayTag').mockImplementation((tag) => tag);
+      vi.spyOn(calculator, 'calculateVersion').mockResolvedValue('1.1.0');
+      vi.spyOn(versionCalculatorModule, 'calculateVersion').mockResolvedValue('1.1.0');
+
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        fullConfig: { ...mockConfig, packageSpecificTags: true, writeChangelog: false },
+      });
+
+      await processor.processPackages([mockPackages[0]]);
+
+      expect(gitTags.getLatestStableTagForPackage).toHaveBeenCalled();
+      const calls = vi.mocked(jsonOutput.addChangelogData).mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls[0][0]).toMatchObject({ previousVersion: 'package-a@v1.0.0' });
+    });
+
+    it('should not use the stable base when releasing a prerelease (no graduation)', async () => {
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('package-a@v1.1.0-next.0');
+      vi.spyOn(gitTags, 'getLatestStableTagForPackage').mockResolvedValue('package-a@v1.0.0');
+      vi.spyOn(formatting, 'displayTag').mockImplementation((tag) => tag);
+      vi.spyOn(calculator, 'calculateVersion').mockResolvedValue('1.1.0-next.1');
+      vi.spyOn(versionCalculatorModule, 'calculateVersion').mockResolvedValue('1.1.0-next.1');
+
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        fullConfig: { ...mockConfig, packageSpecificTags: true, writeChangelog: false },
+      });
+
+      await processor.processPackages([mockPackages[0]]);
+
+      expect(gitTags.getLatestStableTagForPackage).not.toHaveBeenCalled();
+      const calls = vi.mocked(jsonOutput.addChangelogData).mock.calls;
+      expect(calls[0][0]).toMatchObject({ previousVersion: 'package-a@v1.1.0-next.0' });
+    });
+
+    it('should graduate against the global stable tag when packageSpecificTags is off', async () => {
+      // No package-specific tags → latestTag comes from the injected global lookup. A global
+      // prerelease graduating to stable must range from the last *global* stable tag. No manifest
+      // is found, so the global-tag fallback path is exercised.
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('');
+      vi.spyOn(gitTags, 'getLatestStableTag').mockResolvedValue('v1.0.0');
+      vi.spyOn(gitTags, 'getLatestStableTagForPackage').mockResolvedValue('');
+      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
+        version: null,
+        manifestFound: false,
+        manifestPath: '',
+        manifestType: null,
+      });
+      vi.spyOn(formatting, 'displayTag').mockImplementation((tag) => tag);
+      vi.spyOn(calculator, 'calculateVersion').mockResolvedValue('1.1.0');
+      vi.spyOn(versionCalculatorModule, 'calculateVersion').mockResolvedValue('1.1.0');
+
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        getLatestTag: vi.fn().mockResolvedValue('v1.1.0-next.0'),
+        fullConfig: { ...mockConfig, packageSpecificTags: false, writeChangelog: false },
+      });
+
+      await processor.processPackages([mockPackages[1]]);
+
+      expect(gitTags.getLatestStableTag).toHaveBeenCalled();
+      expect(gitTags.getLatestStableTagForPackage).not.toHaveBeenCalled();
+      const calls = vi.mocked(jsonOutput.addChangelogData).mock.calls;
+      expect(calls[0][0]).toMatchObject({ previousVersion: 'v1.0.0' });
+    });
+
+    it('should graduate against the global stable tag when packageSpecificTags is on but the package has no tags', async () => {
+      // The mismatch case: packageSpecificTags is true but the package has no tag history, so
+      // latestTag falls back to the global tag. The stable base must follow that fallback (global)
+      // rather than the empty package series, which would over-include every commit.
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('');
+      vi.spyOn(gitTags, 'getLatestStableTag').mockResolvedValue('v1.0.0');
+      vi.spyOn(gitTags, 'getLatestStableTagForPackage').mockResolvedValue('');
+      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
+        version: null,
+        manifestFound: false,
+        manifestPath: '',
+        manifestType: null,
+      });
+      vi.spyOn(formatting, 'displayTag').mockImplementation((tag) => tag);
+      vi.spyOn(calculator, 'calculateVersion').mockResolvedValue('1.1.0');
+      vi.spyOn(versionCalculatorModule, 'calculateVersion').mockResolvedValue('1.1.0');
+
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        getLatestTag: vi.fn().mockResolvedValue('v1.1.0-next.0'),
+        fullConfig: { ...mockConfig, packageSpecificTags: true, writeChangelog: false },
+      });
+
+      await processor.processPackages([mockPackages[1]]);
+
+      expect(gitTags.getLatestStableTag).toHaveBeenCalled();
+      expect(gitTags.getLatestStableTagForPackage).not.toHaveBeenCalled();
+      const calls = vi.mocked(jsonOutput.addChangelogData).mock.calls;
+      expect(calls[0][0]).toMatchObject({ previousVersion: 'v1.0.0' });
+    });
+
+    it('should warn when a package has no prior tag (full-history changelog)', async () => {
+      // No package tag and no global tag — only the manifest version is available, so hasRealTag is
+      // false and the changelog spans the full history. The warning makes this visible (and heads off
+      // the opaque oversized-PR-body 422).
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('');
+      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
+        version: '0.1.0',
+        manifestFound: true,
+        manifestPath: 'package.json',
+        manifestType: 'package.json',
+      });
+      vi.spyOn(calculator, 'calculateVersion').mockResolvedValue('0.1.1');
+      vi.spyOn(versionCalculatorModule, 'calculateVersion').mockResolvedValue('0.1.1');
+
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        getLatestTag: vi.fn().mockResolvedValue(null), // no global tag either
+        fullConfig: { ...mockConfig, packageSpecificTags: true, writeChangelog: false },
+      });
+
+      await processor.processPackages([mockPackages[1]]);
+
+      expect(logging.log).toHaveBeenCalledWith(expect.stringContaining('No prior tag found for package-b'), 'warning');
+      // ...and NOT the misleading "shallow clone / unpushed" warning about the synthetic
+      // manifest-fallback tag, which never existed as a git ref.
+      expect(logging.log).not.toHaveBeenCalledWith(
+        expect.stringContaining('could not be verified from HEAD'),
+        'warning',
+      );
+    });
+
+    it('should bound repo-level changelog by the nearest reachable tag, even when getLatestTag is prefix-blind', async () => {
+      // package-a has no specific tag; getVersionFromManifests returns a manifest version via the
+      // global beforeEach mock, making hasRealTag=false and revisionRange='HEAD'. The baseline floor
+      // must come from getNearestReachableTag (git describe), which finds per-package prefixed tags.
+      // The injected getLatestTag (git-semver-tags, bare-semver only) returns '' for such repos —
+      // sourcing the floor from it collapsed the range to full history, the bug this guards against.
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('');
+      vi.spyOn(gitTags, 'getNearestReachableTag').mockResolvedValue('wdio-dioxus-bridge@v1.0.0-next.2');
+      vi.spyOn(calculator, 'calculateVersion').mockResolvedValue('1.1.0');
+      vi.spyOn(versionCalculatorModule, 'calculateVersion').mockResolvedValue('1.1.0');
+      const extractSharedSpy = vi.spyOn(commitParser, 'extractRepoLevelChangelogEntries').mockResolvedValue([]);
+
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        getLatestTag: vi.fn().mockResolvedValue(''), // prefix-blind: no bare-semver tag in this repo
+        fullConfig: { ...mockConfig, packageSpecificTags: true, writeChangelog: false },
+      });
+
+      await processor.processPackages([mockPackages[0]]); // package-a triggers manifest fallback
+
+      expect(extractSharedSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        'wdio-dioxus-bridge@v1.0.0-next.2..HEAD',
+        expect.any(Array),
+        expect.any(Array),
+      );
+    });
+
+    it('should fall back to HEAD range for shared entries when no tag is reachable', async () => {
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('');
+      vi.spyOn(gitTags, 'getNearestReachableTag').mockResolvedValue('');
+      vi.spyOn(calculator, 'calculateVersion').mockResolvedValue('1.1.0');
+      vi.spyOn(versionCalculatorModule, 'calculateVersion').mockResolvedValue('1.1.0');
+      const extractSharedSpy = vi.spyOn(commitParser, 'extractRepoLevelChangelogEntries').mockResolvedValue([]);
+
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        fullConfig: { ...mockConfig, packageSpecificTags: true, writeChangelog: false },
+      });
+
+      await processor.processPackages([mockPackages[0]]);
+
+      expect(extractSharedSpy).toHaveBeenCalledWith(expect.any(String), 'HEAD', expect.any(Array), expect.any(Array));
+    });
+
+    it('should classify against the full workspace, not the release set, so a non-releasing package does not leak into shared', async () => {
+      const extractSharedSpy = vi.spyOn(commitParser, 'extractRepoLevelChangelogEntries').mockResolvedValue([]);
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        fullConfig: {
+          ...mockConfig,
+          allWorkspacePackages: [
+            { name: 'package-a', dir: '/path/to/package-a' },
+            { name: 'package-b', dir: '/path/to/package-b' },
+          ],
+        },
+      });
+
+      // Release set is only package-a, but package-b's dir must still count as "a package dir" so a
+      // commit touching only package-b is attributed to it (absent here), not dumped into shared.
+      await processor.processPackages([mockPackages[0]]);
+
+      expect(extractSharedSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        ['/path/to/package-a', '/path/to/package-b'],
+        expect.any(Array),
+      );
+    });
+
+    it('should route a configured sharedPackages package to repo-level via its dir', async () => {
+      const extractSharedSpy = vi.spyOn(commitParser, 'extractRepoLevelChangelogEntries').mockResolvedValue([]);
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        fullConfig: {
+          ...mockConfig,
+          sharedPackages: ['package-b'],
+          allWorkspacePackages: [
+            { name: 'package-a', dir: '/path/to/package-a' },
+            { name: 'package-b', dir: '/path/to/package-b' },
+          ],
+        },
+      });
+
+      await processor.processPackages([mockPackages[0]]);
+
+      expect(extractSharedSpy).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.any(Array), [
+        '/path/to/package-b',
+      ]);
+    });
+
+    it('should treat no package as shared when sharedPackages is unset — no hardcoded names', async () => {
+      const extractSharedSpy = vi.spyOn(commitParser, 'extractRepoLevelChangelogEntries').mockResolvedValue([]);
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        fullConfig: {
+          ...mockConfig,
+          // @releasekit/core was formerly hardcoded as shared; it must no longer auto-match.
+          allWorkspacePackages: [
+            { name: '@releasekit/core', dir: '/path/to/core' },
+            { name: 'package-a', dir: '/path/to/package-a' },
+          ],
+        },
+      });
+
+      await processor.processPackages([mockPackages[0]]);
+
+      expect(extractSharedSpy).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.any(Array), []);
+    });
+
     it('should emit repo-level entries as sharedEntries, not in individual package changelogs', async () => {
       const repoLevelEntry = { type: 'chore', description: 'Update CI workflow' };
       const pkgAEntry = { type: 'added', description: 'New feature in pkg-a' };
@@ -376,7 +703,7 @@ describe('Package Processor', () => {
         if (_dir.includes('package-a')) return [pkgAEntry];
         return [];
       });
-      vi.spyOn(commitParser, 'extractRepoLevelChangelogEntries').mockReturnValue([repoLevelEntry]);
+      vi.spyOn(commitParser, 'extractRepoLevelChangelogEntries').mockResolvedValue([repoLevelEntry]);
 
       const processor = new PackageProcessor({ ...defaultOptions });
       await processor.processPackages(mockPackages);
@@ -398,6 +725,7 @@ describe('Package Processor', () => {
 
       // Tags are tracked via JSON output, not created directly
       expect(jsonOutput.addTag).toHaveBeenCalledWith('v1.1.0');
+      expect(jsonOutput.setPackageUpdateTag).toHaveBeenCalledWith('package-a', 'v1.1.0');
       expect(jsonOutput.setCommitMessage).toHaveBeenCalled();
     });
 
@@ -594,6 +922,36 @@ describe('Package Processor', () => {
         '/path/to/hybrid-package/package.json',
         '1.1.0',
         false,
+      );
+      expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(
+        '/path/to/hybrid-package/Cargo.toml',
+        '1.1.0',
+        false,
+      );
+    });
+
+    it('should skip package.json but still update Cargo.toml when version.npm.enabled is false', async () => {
+      vi.spyOn(fs, 'existsSync').mockImplementation(() => true);
+
+      const hybridPackage = {
+        ...mockPackages[0],
+        dir: '/path/to/hybrid-package',
+        packageJson: { name: 'hybrid-package', version: '0.1.0' },
+      };
+
+      const processor = new PackageProcessor({
+        getLatestTag: gitTags.getLatestTag,
+        config: {},
+        fullConfig: { ...mockConfig, npm: { enabled: false } },
+      });
+
+      await processor.processPackages([hybridPackage]);
+
+      // npm opted out → package.json is left untouched; Cargo.toml is still versioned.
+      expect(packageManagement.updatePackageVersion).not.toHaveBeenCalledWith(
+        '/path/to/hybrid-package/package.json',
+        expect.anything(),
+        expect.anything(),
       );
       expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(
         '/path/to/hybrid-package/Cargo.toml',
@@ -1168,6 +1526,51 @@ describe('Package Processor', () => {
 
       // Verify the tag was tracked via JSON output with the correct format
       expect(jsonOutput.addTag).toHaveBeenCalledWith('ver1.1.0');
+    });
+  });
+
+  // strictReachable must abort the run, not silently degrade. Both tests run with the SAME
+  // strictReachable:true config so the only variable is the error TYPE: an unreachable-baseline
+  // StrictReachableError aborts; a genuine extraction error still degrades to a minimal entry.
+  describe('strictReachable (#372)', () => {
+    beforeEach(() => {
+      // A real per-package tag so the resolver takes the verify-baseline branch (hasRealTag = true).
+      vi.spyOn(gitTags, 'getLatestTagForPackage').mockResolvedValue('v1.0.0');
+    });
+
+    it('should abort the run with a StrictReachableError when the baseline is unreachable', async () => {
+      vi.spyOn(tagVerification, 'verifyTag').mockResolvedValue({
+        exists: true,
+        reachable: false,
+        error: 'exists but is not an ancestor of HEAD',
+      });
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        config: { ...defaultOptions.config, strictReachable: true },
+        fullConfig: { ...mockConfig, strictReachable: true },
+      });
+
+      await expect(processor.processPackages(mockPackages)).rejects.toBeInstanceOf(StrictReachableError);
+    });
+
+    it('should still degrade a genuine changelog-extraction error to a minimal entry', async () => {
+      // Baseline reachable (no strict violation), but commit parsing throws — the catch must swallow
+      // this and fall back, not abort, even though strictReachable is on.
+      vi.spyOn(tagVerification, 'verifyTag').mockResolvedValue({ exists: true, reachable: true });
+      vi.spyOn(commitParser, 'extractChangelogEntriesFromCommits').mockImplementation(() => {
+        throw new Error('git log failed');
+      });
+      const processor = new PackageProcessor({
+        ...defaultOptions,
+        config: { ...defaultOptions.config, strictReachable: true },
+        fullConfig: { ...mockConfig, strictReachable: true },
+      });
+
+      await expect(processor.processPackages(mockPackages)).resolves.toBeDefined();
+      expect(vi.mocked(logging.log)).toHaveBeenCalledWith(
+        expect.stringContaining('Error extracting changelog entries'),
+        'warning',
+      );
     });
   });
 });

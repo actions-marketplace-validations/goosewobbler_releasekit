@@ -1,7 +1,47 @@
 import type { VersionOutput } from '@releasekit/core';
 import { describe, expect, it } from 'vitest';
-import { formatPreviewComment } from '../../src/preview-format.js';
+import { formatPreviewComment } from '../../src/preview/format.js';
+import type { MergedRow } from '../../src/preview/merge.js';
+import type { StandingPRSnapshot } from '../../src/standing-pr/standing-pr.js';
 import type { ReleaseOutput } from '../../src/types.js';
+
+function snapshotFor(
+  updates: Array<{ name: string; version: string; previousVersion?: string }>,
+  overrides: Partial<StandingPRSnapshot> = {},
+): StandingPRSnapshot {
+  return {
+    number: 42,
+    url: 'https://github.com/owner/repo/pull/42',
+    openedAt: new Date(Date.now() - 2 * 3_600_000).toISOString(), // 2h ago
+    gateState: 'success',
+    manifest: {
+      schemaVersion: 2,
+      versionOutput: {
+        dryRun: false,
+        updates: updates.map((u) => ({
+          packageName: u.name,
+          newVersion: u.version,
+          filePath: `packages/${u.name}/package.json`,
+        })),
+        changelogs: updates.map((u) => ({
+          packageName: u.name,
+          version: u.version,
+          previousVersion: u.previousVersion ?? '0.4.0',
+          revisionRange: `v${u.previousVersion ?? '0.4.0'}..HEAD`,
+          repoUrl: null,
+          entries: [],
+        })),
+        tags: [],
+      },
+      releaseNotes: {},
+      notesFiles: [],
+      createdAt: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+      baseSha: 'abc',
+      firstUpdatedAt: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+    },
+    ...overrides,
+  };
+}
 
 const versionOutput: VersionOutput = {
   dryRun: true,
@@ -72,10 +112,93 @@ describe('formatPreviewComment', () => {
     expect(result).toContain('<summary><b>Release Preview</b> — my-lib 1.0.0</summary>');
   });
 
-  it('should include package table', () => {
+  it('should annotate the resolved version action in the single-package summary when present', () => {
+    const graduated: ReleaseOutput = {
+      versionOutput: {
+        dryRun: true,
+        updates: [
+          {
+            packageName: 'my-lib',
+            newVersion: '1.0.0',
+            filePath: 'package.json',
+            action: 'graduated',
+            actionReason: 'Graduated 1.0.0-next.1 → 1.0.0 (bump ignored).',
+          },
+        ],
+        changelogs: [],
+        tags: ['v1.0.0'],
+      },
+      notesGenerated: false,
+    };
+    const result = formatPreviewComment(graduated);
+    expect(result).toContain('<summary><b>Release Preview</b> — my-lib 1.0.0 (graduated)</summary>');
+  });
+
+  it('should annotate a bumped action in the single-package summary', () => {
+    const bumped: ReleaseOutput = {
+      versionOutput: {
+        dryRun: true,
+        updates: [
+          {
+            packageName: 'my-lib',
+            newVersion: '1.1.0',
+            filePath: 'package.json',
+            action: 'bumped',
+            actionReason: 'Bumped to 1.1.0.',
+          },
+        ],
+        changelogs: [],
+        tags: ['v1.1.0'],
+      },
+      notesGenerated: false,
+    };
+    const result = formatPreviewComment(bumped);
+    expect(result).toContain('<summary><b>Release Preview</b> — my-lib 1.1.0 (bumped)</summary>');
+  });
+
+  it('should annotate a first-release action in the single-package summary', () => {
+    const firstRelease: ReleaseOutput = {
+      versionOutput: {
+        dryRun: true,
+        updates: [
+          {
+            packageName: 'my-lib',
+            newVersion: '1.0.0',
+            filePath: 'package.json',
+            action: 'first-release',
+            actionReason: 'First release (no prior tag).',
+          },
+        ],
+        changelogs: [],
+        tags: ['v1.0.0'],
+      },
+      notesGenerated: false,
+    };
+    const result = formatPreviewComment(firstRelease);
+    expect(result).toContain('<summary><b>Release Preview</b> — my-lib 1.0.0 (first-release)</summary>');
+  });
+
+  it('should render the single-package summary cleanly when the action field is absent (old manifest)', () => {
+    const noAction: ReleaseOutput = {
+      versionOutput: {
+        dryRun: true,
+        updates: [{ packageName: 'my-lib', newVersion: '1.0.0', filePath: 'package.json' }],
+        changelogs: [],
+        tags: ['v1.0.0'],
+      },
+      notesGenerated: false,
+    };
+    const result = formatPreviewComment(noAction);
+    // No empty parenthetical, no "undefined" leaking from the absent field.
+    expect(result).toContain('<summary><b>Release Preview</b> — my-lib 1.0.0</summary>');
+    expect(result).not.toContain('my-lib 1.0.0 ()');
+    expect(result).not.toContain('undefined');
+  });
+
+  it('should not include package table', () => {
     const result = formatPreviewComment(releaseOutput);
-    expect(result).toContain('| `@releasekit/version` | 0.3.1 |');
-    expect(result).toContain('| `@releasekit/notes` | 0.3.1 |');
+    expect(result).not.toContain('### Packages');
+    expect(result).not.toContain('| `@releasekit/version` | 0.3.1 |');
   });
 
   it('should include changelog with entry grouping by type', () => {
@@ -83,9 +206,67 @@ describe('formatPreviewComment', () => {
     expect(result).toContain('#### Added');
     expect(result).toContain('- New dry-run flag (`cli`)');
     expect(result).toContain('#### Fixed');
-    expect(result).toContain('- Fix prerelease sorting (`semver`) #42');
+    // Bare #NNN renders as a canonical link by default (refs: 'link'); the ref group carries
+    // its own parens (an entry with no identified PR falls back to the plain list).
+    expect(result).toContain(
+      '- Fix prerelease sorting (`semver`) ([#42](https://github.com/goosewobbler/releasekit/issues/42))',
+    );
     expect(result).toContain('#### Chores');
     expect(result).toContain('- Migrate to Vitest');
+  });
+
+  it('should render bare #NNN refs per the refs mode', () => {
+    expect(formatPreviewComment(releaseOutput, { refs: 'escape' })).toContain(
+      '- Fix prerelease sorting (`semver`) (\\#42)',
+    );
+    const stripped = formatPreviewComment(releaseOutput, { refs: 'strip' });
+    expect(stripped).toContain('- Fix prerelease sorting (`semver`)');
+    expect(stripped).not.toContain('#42');
+    expect(stripped).not.toContain('[#42]');
+  });
+
+  it('should label the PR and closed issues when an entry carries a prNumber', () => {
+    const withPr = structuredClone(releaseOutput);
+    const firstChangelog = withPr.versionOutput.changelogs[0];
+    if (firstChangelog) {
+      firstChangelog.entries = [
+        {
+          type: 'fixed',
+          description: 'Fix prerelease sorting',
+          scope: 'semver',
+          issueIds: ['#503', '#500'],
+          prNumber: '#503',
+        },
+      ];
+    }
+    const result = formatPreviewComment(withPr);
+    expect(result).toContain(
+      '- Fix prerelease sorting (`semver`) (PR [#503](https://github.com/goosewobbler/releasekit/pull/503) · closes [#500](https://github.com/goosewobbler/releasekit/issues/500))',
+    );
+  });
+
+  it('should blockquote the changelog entry content but leave the disclosure tags un-quoted', () => {
+    const result = formatPreviewComment(releaseOutput);
+    // The `### Changelog` heading and the <details>/<summary> tags stay un-quoted (raw HTML renders
+    // unreliably under `> `); only the entry content inside carries the blockquote bar.
+    expect(result).toContain('### Changelog');
+    expect(result).toContain('<details>');
+    expect(result).not.toContain('> <details>');
+    expect(result).not.toContain('> </details>');
+    expect(result).toContain('<summary><b>@releasekit/version</b> 0.3.0 → 0.3.1</summary>');
+    expect(result).toContain('> #### Added');
+    expect(result).toContain('> - New dry-run flag (`cli`)');
+  });
+
+  it('should always neutralise @-mentions in preview descriptions', () => {
+    const withMention = structuredClone(releaseOutput);
+    const firstChangelog = withMention.versionOutput.changelogs[0];
+    if (firstChangelog) {
+      firstChangelog.entries = [{ type: 'added', description: 'Support @wdio/native-cdp-bridge' }];
+    }
+    for (const refs of ['link', 'escape', 'strip'] as const) {
+      expect(formatPreviewComment(withMention, { refs })).toContain('- Support \\@wdio/native-cdp-bridge');
+    }
   });
 
   it('should wrap each package changelog in details element', () => {
@@ -96,10 +277,41 @@ describe('formatPreviewComment', () => {
     expect(result).toContain('</details>');
   });
 
-  it('should include tags', () => {
+  it('should render the changelog header with a bare previous version when previousVersion is a package tag', () => {
+    const taggedOutput: ReleaseOutput = {
+      versionOutput: {
+        dryRun: true,
+        updates: [
+          {
+            packageName: '@wdio/electron-service',
+            newVersion: '10.2.0',
+            filePath: 'packages/electron-service/package.json',
+          },
+        ],
+        changelogs: [
+          {
+            packageName: '@wdio/electron-service',
+            version: '10.2.0',
+            // Stored as the consumer tag; the header must strip it to the bare semver.
+            previousVersion: 'wdio-electron-service@v10.1.0',
+            revisionRange: 'wdio-electron-service@v10.1.0..HEAD',
+            repoUrl: null,
+            entries: [{ type: 'added', description: 'New widget' }],
+          },
+        ],
+        tags: ['wdio-electron-service@v10.2.0'],
+      },
+      notesGenerated: false,
+    };
+    const result = formatPreviewComment(taggedOutput);
+    expect(result).toContain('<b>@wdio/electron-service</b> 10.1.0 → 10.2.0');
+    expect(result).not.toContain('wdio-electron-service@v10.1.0 → 10.2.0');
+  });
+
+  it('should not include tags section', () => {
     const result = formatPreviewComment(releaseOutput);
-    expect(result).toContain('- `@releasekit/version@v0.3.1`');
-    expect(result).toContain('- `@releasekit/notes@v0.3.1`');
+    expect(result).not.toContain('### Tags');
+    expect(result).not.toContain('- `@releasekit/version@v0.3.1`');
   });
 
   describe('shared entries rendering', () => {
@@ -238,11 +450,6 @@ describe('formatPreviewComment', () => {
       expect(result).toContain('These changes will be added to the release PR (#99) when merged:');
     });
 
-    it('should use scheduled intro when strategy is scheduled', () => {
-      const result = formatPreviewComment(releaseOutput, { strategy: 'scheduled' });
-      expect(result).toContain('These changes will be included in the next scheduled release:');
-    });
-
     // No-changes messages per strategy
 
     it('should show direct no-changes message by default', () => {
@@ -264,10 +471,600 @@ describe('formatPreviewComment', () => {
       const result = formatPreviewComment(null, { strategy: 'standing-pr' });
       expect(result).toContain('will not affect the release PR');
     });
+  });
 
-    it('should show scheduled no-changes message', () => {
-      const result = formatPreviewComment(null, { strategy: 'scheduled' });
-      expect(result).toContain('will not be included in the next scheduled release');
+  // --- Standing PR snapshot + merge table ---
+
+  describe('standing PR snapshot', () => {
+    it('should render the snapshot block in the no-release branch when strategy is standing-pr', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      const result = formatPreviewComment(null, { strategy: 'standing-pr', standingPrSnapshot: snapshot });
+      expect(result).toContain('**Standing release PR:**');
+      expect(result).toContain('[#42](https://github.com/owner/repo/pull/42)');
+      expect(result).toContain('1 package queued');
+      expect(result).toContain('✅ ready to merge');
+    });
+
+    it('should render the snapshot one-liner above the collapsible details so it is always visible', () => {
+      const snapshot = snapshotFor([
+        { name: '@a/notes', version: '0.5.0' },
+        { name: '@a/version', version: '0.3.2' },
+      ]);
+      const result = formatPreviewComment(releaseOutput, { strategy: 'standing-pr', standingPrSnapshot: snapshot });
+      expect(result).toContain('**Standing release PR:**');
+      expect(result).toContain('2 packages queued');
+      // The snapshot must precede the <details> open tag (rendered outside, always visible).
+      const detailsIdx = result.indexOf('<details>');
+      const snapshotIdx = result.indexOf('**Standing release PR:**');
+      expect(snapshotIdx).toBeGreaterThan(-1);
+      expect(detailsIdx).toBeGreaterThan(snapshotIdx);
+    });
+
+    it('should show the pending gate badge with countdown when gateState is pending', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }], {
+        gateState: 'pending',
+        gateReason: 'Waiting 4h 20m for minAge',
+      });
+      const result = formatPreviewComment(null, { strategy: 'standing-pr', standingPrSnapshot: snapshot });
+      expect(result).toContain('⏳ Waiting 4h 20m for minAge');
+      expect(result).not.toContain('✅ ready to merge');
+    });
+
+    it('should render all conflict reasons joined in the gate badge', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }], {
+        gateState: 'pending',
+        gateReason: 'Conflicting bump labels; Conflicting channel labels',
+      });
+      const result = formatPreviewComment(null, { strategy: 'standing-pr', standingPrSnapshot: snapshot });
+      expect(result).toContain('⏳ Conflicting bump labels; Conflicting channel labels');
+    });
+
+    it('should omit the snapshot when strategy is not standing-pr (defensive)', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      const result = formatPreviewComment(releaseOutput, { strategy: 'direct', standingPrSnapshot: snapshot });
+      expect(result).not.toContain('**Standing release PR:**');
+    });
+
+    it('should render the merge table with escalation, new, and unchanged annotations', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      const mergedRows: MergedRow[] = [
+        {
+          packageName: '@a/notes',
+          baseline: '0.4.0',
+          standing: '0.4.1',
+          current: '0.5.0',
+          afterMerge: '0.5.0',
+          status: 'escalated',
+        },
+        {
+          packageName: '@a/publish',
+          baseline: '0.2.0',
+          current: '0.2.1',
+          afterMerge: '0.2.1',
+          status: 'new-from-pr',
+        },
+        {
+          packageName: '@a/version',
+          baseline: '0.3.1',
+          standing: '0.3.2',
+          current: '0.3.2',
+          afterMerge: '0.3.2',
+          status: 'unchanged',
+        },
+      ];
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        standingPrSnapshot: snapshot,
+        mergedRows,
+      });
+      expect(result).toContain('### After merge — predicted release');
+      expect(result).toContain('Approximate. The standing PR rebuilds against `main`');
+      expect(result).toContain('| Package | Standing PR | This PR | After merge |');
+      expect(result).toContain('| `@a/notes` | 0.4.1 | 0.5.0 | 0.5.0 ⚠ escalated from 0.4.1 |');
+      expect(result).toContain('| `@a/publish` | — | 0.2.1 | 0.2.1 (new) |');
+      expect(result).toContain('| `@a/version` | 0.3.2 | 0.3.2 | 0.3.2 |');
+    });
+
+    it('should show no-escalation prose and a table with all rows when all rows are unchanged', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      const allUnchanged: MergedRow[] = [
+        {
+          packageName: '@a/notes',
+          baseline: '0.4.0',
+          standing: '0.5.0',
+          current: '0.5.0',
+          afterMerge: '0.5.0',
+          status: 'unchanged',
+        },
+        {
+          packageName: '@a/version',
+          baseline: '0.3.0',
+          standing: '0.4.0',
+          current: '0.4.0',
+          afterMerge: '0.4.0',
+          status: 'unchanged',
+        },
+      ];
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        standingPrSnapshot: snapshot,
+        mergedRows: allUnchanged,
+      });
+      expect(result).toContain('### After merge — predicted release');
+      expect(result).toContain('No version escalation');
+      // Participating rows are shown so reviewers can see what's already queued
+      expect(result).toContain('| Package | Standing PR | This PR | After merge |');
+      expect(result).toContain('| `@a/notes` | 0.5.0 | 0.5.0 | 0.5.0 |');
+      expect(result).toContain('| `@a/version` | 0.4.0 | 0.4.0 | 0.4.0 |');
+      expect(result).not.toContain('Approximate. The standing PR rebuilds');
+    });
+
+    it('should show outside-scope prose when all merged rows are standing-only (current PR out of scope)', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      const standingOnlyRows: MergedRow[] = [
+        {
+          packageName: '@a/notes',
+          baseline: '0.4.0',
+          standing: '0.5.0',
+          afterMerge: '0.5.0',
+          status: 'standing-only',
+        },
+      ];
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        standingPrSnapshot: snapshot,
+        mergedRows: standingOnlyRows,
+      });
+      expect(result).toContain('### After merge — predicted release');
+      // packages outside standing scope — different message from allUnchanged
+      expect(result).toContain("outside the standing PR's current scope");
+      expect(result).not.toContain('No version escalation');
+      expect(result).toContain('| `@a/notes` | 0.5.0 | — | 0.5.0 |');
+      expect(result).not.toContain('Approximate. The standing PR rebuilds');
+    });
+
+    it('should omit the merge table when no rows are provided', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      const result = formatPreviewComment(releaseOutput, { strategy: 'standing-pr', standingPrSnapshot: snapshot });
+      expect(result).not.toContain('### After merge');
+    });
+
+    it('should not change output when no snapshot is provided (regression guard)', () => {
+      const withoutSnapshot = formatPreviewComment(releaseOutput, { strategy: 'standing-pr' });
+      expect(withoutSnapshot).not.toContain('**Standing release PR:**');
+      expect(withoutSnapshot).not.toContain('### After merge');
+    });
+
+    it('should use "this PR contributes no changes" summary when snapshot is present and no result', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      const result = formatPreviewComment(null, { strategy: 'standing-pr', standingPrSnapshot: snapshot });
+      expect(result).toContain('<summary><b>Release Preview</b> — this PR contributes no changes</summary>');
+      expect(result).not.toContain('— no release</summary>');
+    });
+
+    it('should keep "no release" summary when snapshot is absent', () => {
+      const result = formatPreviewComment(null, { strategy: 'standing-pr' });
+      expect(result).toContain('<summary><b>Release Preview</b> — no release</summary>');
+    });
+
+    it('should render a queued-for-release table inside the details when no result and snapshot has changelogs', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      snapshot.manifest.versionOutput.changelogs = [
+        {
+          packageName: '@a/notes',
+          version: '0.5.0',
+          previousVersion: '0.4.2',
+          revisionRange: 'v0.4.2..HEAD',
+          repoUrl: null,
+          entries: [{ type: 'feat', description: 'queued change' }],
+        },
+        {
+          packageName: '@a/version',
+          version: '0.3.2',
+          // Stored as the consumer tag; the table must strip it to the bare semver.
+          previousVersion: '@a/version@v0.3.1',
+          revisionRange: '@a/version@v0.3.1..HEAD',
+          repoUrl: null,
+          entries: [{ type: 'fix', description: 'queued fix' }],
+        },
+      ];
+      const result = formatPreviewComment(null, { strategy: 'standing-pr', standingPrSnapshot: snapshot });
+      expect(result).toContain('### Currently queued for release');
+      expect(result).toContain('| Package | Current | Next |');
+      expect(result).toContain('| `@a/notes` | 0.4.2 | 0.5.0 |');
+      expect(result).toContain('| `@a/version` | 0.3.1 | 0.3.2 |');
+    });
+
+    it('should omit the queued table when snapshot has no packages being released', () => {
+      // version === previousVersion means the package is not being released
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0', previousVersion: '0.5.0' }]);
+      const result = formatPreviewComment(null, { strategy: 'standing-pr', standingPrSnapshot: snapshot });
+      expect(result).not.toContain('### Currently queued for release');
+    });
+
+    it('should render the immediate banner when labelContext.immediate is set', () => {
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        labelContext: {
+          trigger: 'commit',
+          skip: false,
+          noBumpLabel: false,
+          immediate: true,
+          labels: {
+            graduate: 'release:graduate',
+            prerelease: 'channel:prerelease',
+            skip: 'release:skip',
+            immediate: 'release:immediate',
+            major: 'bump:major',
+            minor: 'bump:minor',
+            patch: 'bump:patch',
+          },
+        },
+      });
+      expect(result).toContain('`release:immediate`');
+      expect(result).toContain('bypassing the standing PR for a direct release');
+      expect(result).toContain('bump derived from conventional commits');
+    });
+
+    it('should detail the bump magnitude and source label in the immediate banner', () => {
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        labelContext: {
+          trigger: 'label',
+          skip: false,
+          noBumpLabel: false,
+          immediate: true,
+          bumpLabel: 'minor',
+          labels: {
+            graduate: 'release:graduate',
+            prerelease: 'channel:prerelease',
+            skip: 'release:skip',
+            immediate: 'release:immediate',
+            major: 'bump:major',
+            minor: 'bump:minor',
+            patch: 'bump:patch',
+          },
+        },
+      });
+      expect(result).toContain('direct **minor** release (from `bump:minor`)');
+      expect(result).not.toContain('bump derived from conventional commits');
+    });
+
+    it('should combine bump + prerelease channel + scope in the immediate banner', () => {
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        labelContext: {
+          trigger: 'label',
+          skip: false,
+          noBumpLabel: false,
+          immediate: true,
+          bumpLabel: 'minor',
+          prerelease: true,
+          scopeLabels: ['scope:docs'],
+          labels: {
+            graduate: 'release:graduate',
+            prerelease: 'channel:prerelease',
+            skip: 'release:skip',
+            immediate: 'release:immediate',
+            major: 'bump:major',
+            minor: 'bump:minor',
+            patch: 'bump:patch',
+          },
+        },
+      });
+      expect(result).toContain('direct **minor prerelease** release');
+      expect(result).toContain('from `bump:minor`, `channel:prerelease`');
+      expect(result).toContain('scope: `scope:docs`');
+    });
+
+    it('should include scope when immediate is set without a bump label', () => {
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        labelContext: {
+          trigger: 'label',
+          skip: false,
+          noBumpLabel: false,
+          immediate: true,
+          scopeLabels: ['scope:all'],
+          labels: {
+            graduate: 'release:graduate',
+            prerelease: 'channel:prerelease',
+            skip: 'release:skip',
+            immediate: 'release:immediate',
+            major: 'bump:major',
+            minor: 'bump:minor',
+            patch: 'bump:patch',
+          },
+        },
+      });
+      expect(result).toContain('bump derived from conventional commits');
+      expect(result).toContain('scope: `scope:all`');
+    });
+
+    it('should suppress the standing-PR snapshot when immediate label is set', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        standingPrSnapshot: snapshot,
+        labelContext: {
+          trigger: 'commit',
+          skip: false,
+          noBumpLabel: false,
+          immediate: true,
+        },
+      });
+      expect(result).not.toContain('**Standing release PR:**');
+      expect(result).not.toContain('### After merge');
+    });
+
+    it('should use direct-release intro message when immediate label is set', () => {
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        labelContext: {
+          trigger: 'commit',
+          skip: false,
+          noBumpLabel: false,
+          immediate: true,
+        },
+      });
+      expect(result).toContain('This PR will trigger the following release when merged:');
+      expect(result).not.toContain('release PR');
+    });
+
+    it('should render the advisory banner in standing-pr mode without immediate', () => {
+      const result = formatPreviewComment(null, {
+        strategy: 'standing-pr',
+        labelContext: {
+          trigger: 'label',
+          skip: false,
+          noBumpLabel: false,
+          advisoryInStandingPr: true,
+          bumpLabel: 'patch',
+          scopeLabels: ['scope:all'],
+          labels: {
+            graduate: 'release:graduate',
+            prerelease: 'channel:prerelease',
+            skip: 'release:skip',
+            immediate: 'release:immediate',
+            major: 'bump:major',
+            minor: 'bump:minor',
+            patch: 'bump:patch',
+          },
+        },
+      });
+      expect(result).toContain('Labels on this PR are advisory in standing-pr mode');
+      expect(result).toContain('saw: `bump:patch`, `scope:all`');
+      expect(result).toContain('`release:immediate`');
+      expect(result).toContain('override by editing labels on the standing PR itself');
+    });
+
+    it('should suppress the regular trigger-mode banners', () => {
+      // With advisoryInStandingPr, the "no bump label detected" banner should NOT render.
+      const result = formatPreviewComment(null, {
+        strategy: 'standing-pr',
+        labelContext: {
+          trigger: 'label',
+          skip: false,
+          noBumpLabel: false,
+          advisoryInStandingPr: true,
+          labels: {
+            graduate: 'release:graduate',
+            prerelease: 'channel:prerelease',
+            skip: 'release:skip',
+            immediate: 'release:immediate',
+            major: 'bump:major',
+            minor: 'bump:minor',
+            patch: 'bump:patch',
+          },
+        },
+      });
+      expect(result).not.toContain('No bump label detected');
+    });
+  });
+
+  // --- Sync mode rendering ---
+
+  describe('sync mode rendering', () => {
+    const syncVersionOutput: VersionOutput = {
+      dryRun: true,
+      strategy: 'sync',
+      updates: [
+        { packageName: 'my-monorepo', newVersion: '0.24.0', filePath: 'package.json', isRoot: true },
+        { packageName: '@scope/version', newVersion: '0.24.0', filePath: 'packages/version/package.json' },
+        { packageName: '@scope/notes', newVersion: '0.24.0', filePath: 'packages/notes/package.json' },
+        { packageName: '@scope/publish', newVersion: '0.24.0', filePath: 'packages/publish/package.json' },
+        { packageName: '@scope/release', newVersion: '0.24.0', filePath: 'packages/release/package.json' },
+      ],
+      changelogs: [
+        {
+          packageName: 'monorepo',
+          version: '0.24.0',
+          previousVersion: 'v0.23.0',
+          revisionRange: 'release/v0.23.0..HEAD',
+          repoUrl: null,
+          entries: [{ type: 'added', description: 'A new feature' }],
+        },
+      ],
+      tags: ['v0.24.0'],
+    };
+    const syncReleaseOutput: ReleaseOutput = { versionOutput: syncVersionOutput, notesGenerated: false };
+
+    function syncSnapshot(): StandingPRSnapshot {
+      const snapshot = snapshotFor([]);
+      snapshot.manifest.versionOutput = syncVersionOutput;
+      return snapshot;
+    }
+
+    it('should show the version range in the summary instead of a package count', () => {
+      const result = formatPreviewComment(syncReleaseOutput);
+      expect(result).toContain('<summary><b>Release Preview</b> — v0.23.0 → v0.24.0</summary>');
+      expect(result).not.toContain('5 packages');
+    });
+
+    it('should show only the next version in the summary when there is no previous version', () => {
+      const noPrev: ReleaseOutput = {
+        versionOutput: {
+          ...syncVersionOutput,
+          changelogs: [{ ...syncVersionOutput.changelogs[0], previousVersion: null }],
+        },
+        notesGenerated: false,
+      };
+      const result = formatPreviewComment(noPrev);
+      expect(result).toContain('<summary><b>Release Preview</b> — v0.24.0</summary>');
+    });
+
+    it('should list sync-bumped packages by bare name under an all-packages heading, excluding the root', () => {
+      const result = formatPreviewComment(syncReleaseOutput);
+      expect(result).toContain('**All packages → 0.24.0** (sync versioning)');
+      expect(result).toContain('- `@scope/version`');
+      expect(result).toContain('- `@scope/release`');
+      // Root lockstep bump is not a publishable package
+      expect(result).not.toContain('my-monorepo');
+      // Version appears once in the heading, not per item
+      expect(result).not.toContain('`@scope/version` → 0.24.0');
+    });
+
+    it('should fall back to an "Also bumped" heading when some packages have their own changelogs', () => {
+      const withPackageChangelog: ReleaseOutput = {
+        versionOutput: {
+          ...syncVersionOutput,
+          changelogs: [
+            ...syncVersionOutput.changelogs,
+            {
+              packageName: '@scope/version',
+              version: '0.24.0',
+              previousVersion: 'v0.23.0',
+              revisionRange: 'release/v0.23.0..HEAD',
+              repoUrl: null,
+              entries: [{ type: 'fixed', description: 'A package-specific fix' }],
+            },
+          ],
+        },
+        notesGenerated: false,
+      };
+      const result = formatPreviewComment(withPackageChangelog);
+      // @scope/version renders its own changelog above, so the list below is not "all" packages
+      expect(result).toContain('**Also bumped → 0.24.0** (sync versioning)');
+      expect(result).not.toContain('**All packages');
+      expect(result).toContain('- `@scope/notes`');
+      expect(result).not.toContain('- `@scope/version`');
+    });
+
+    it('should lead the standing PR snapshot line with the queued version and publishable count', () => {
+      const result = formatPreviewComment(null, { strategy: 'standing-pr', standingPrSnapshot: syncSnapshot() });
+      expect(result).toContain('v0.24.0 queued (4 packages)');
+      expect(result).not.toContain('1 package queued');
+    });
+
+    it('should keep the count-based rendering when the manifest has no strategy field (pre-strategy data)', () => {
+      const legacyOutput: VersionOutput = { ...syncVersionOutput, strategy: undefined };
+      const snapshot = snapshotFor([]);
+      snapshot.manifest.versionOutput = legacyOutput;
+      const snapshotResult = formatPreviewComment(null, { strategy: 'standing-pr', standingPrSnapshot: snapshot });
+      expect(snapshotResult).toContain('1 package queued');
+
+      const summaryResult = formatPreviewComment(
+        { versionOutput: legacyOutput, notesGenerated: false },
+        { strategy: 'direct' },
+      );
+      expect(summaryResult).toContain('<summary><b>Release Preview</b> — 5 packages</summary>');
+      expect(summaryResult).toContain('**Also bumped** (sync versioning)');
+    });
+  });
+
+  // --- Synthetic version-bump entries ---
+
+  describe('synthetic version-bump entries', () => {
+    // A sync/lockstep carry: a bumped package with no commits of its own gets a fabricated
+    // `Update version to X` placeholder from the version engine. The preview must collapse these
+    // into the "Also bumped" list, not render full changelog blocks of placeholder noise.
+    const syntheticEntry = (v: string) => ({
+      type: 'changed',
+      description: `Update version to ${v}`,
+      synthetic: true,
+    });
+
+    const mixedOutput: VersionOutput = {
+      dryRun: true,
+      strategy: 'group',
+      updates: [
+        { packageName: 'root', newVersion: '1.1.0', filePath: 'package.json', isRoot: true },
+        { packageName: 'embedded-driver', newVersion: '1.1.0', filePath: 'packages/embedded/package.json' },
+        { packageName: 'bridge', newVersion: '1.1.0', filePath: 'packages/bridge/package.json' },
+        { packageName: 'service', newVersion: '1.1.0', filePath: 'packages/service/package.json' },
+      ],
+      changelogs: [
+        {
+          packageName: 'embedded-driver',
+          version: '1.1.0',
+          previousVersion: '1.0.0',
+          revisionRange: 'v1.0.0..HEAD',
+          repoUrl: null,
+          entries: [{ type: 'added', description: 'implement W3C Actions API' }],
+        },
+        {
+          packageName: 'bridge',
+          version: '1.1.0',
+          previousVersion: '1.0.0',
+          revisionRange: 'v1.0.0..HEAD',
+          repoUrl: null,
+          entries: [syntheticEntry('1.1.0')],
+        },
+        {
+          packageName: 'service',
+          version: '1.1.0',
+          previousVersion: '1.0.0',
+          revisionRange: 'v1.0.0..HEAD',
+          repoUrl: null,
+          entries: [syntheticEntry('1.1.0')],
+        },
+      ],
+      tags: [],
+    };
+
+    it('should collapse synthetic-only packages into "Also bumped" instead of full blocks', () => {
+      const result = formatPreviewComment({ versionOutput: mixedOutput, notesGenerated: false });
+      // The package with real changes renders a full block...
+      expect(result).toContain('<summary><b>embedded-driver</b> 1.0.0 → 1.1.0</summary>');
+      expect(result).toContain('implement W3C Actions API');
+      // ...the synthetic-only carries do not — no placeholder noise leaks into the changelog.
+      expect(result).not.toContain('Update version to');
+      expect(result).not.toContain('<summary><b>bridge</b>');
+      expect(result).not.toContain('<summary><b>service</b>');
+      // ...they appear instead as a compact "Also bumped" list.
+      expect(result).toContain('**Also bumped** (sync versioning)');
+      expect(result).toContain('- `bridge` → 1.1.0');
+      expect(result).toContain('- `service` → 1.1.0');
+      // The root lockstep bump is never listed.
+      expect(result).not.toContain('- `root`');
+    });
+
+    it('should show a "no individual changes" heading when every package is synthetic-only', () => {
+      const allSynthetic: VersionOutput = {
+        ...mixedOutput,
+        changelogs: mixedOutput.changelogs.map((cl) => ({ ...cl, entries: [syntheticEntry('1.1.0')] })),
+      };
+      const result = formatPreviewComment({ versionOutput: allSynthetic, notesGenerated: false });
+      expect(result).toContain('**Bumped** (sync versioning — no individual changes)');
+      expect(result).not.toContain('Update version to');
+      expect(result).not.toContain('<summary><b>embedded-driver</b>');
+    });
+
+    it('should keep rendering legacy placeholder entries that lack the synthetic flag (back-compat)', () => {
+      // Manifests written before the flag existed carry the same placeholder text with no flag —
+      // absence must mean "real entry", so they still render as before (no silent disappearance).
+      const legacy: VersionOutput = {
+        ...mixedOutput,
+        changelogs: [
+          {
+            ...mixedOutput.changelogs[1], // bridge
+            entries: [{ type: 'changed', description: 'Update version to 1.1.0' }],
+          },
+        ],
+      };
+      const result = formatPreviewComment({ versionOutput: legacy, notesGenerated: false });
+      expect(result).toContain('<summary><b>bridge</b> 1.0.0 → 1.1.0</summary>');
+      expect(result).toContain('Update version to 1.1.0');
     });
   });
 
@@ -288,7 +1085,7 @@ describe('formatPreviewComment', () => {
       expect(result).toContain('**Warning:**');
       expect(result).toContain('This PR is marked to skip release.');
       // Still shows the preview content underneath
-      expect(result).toContain('### Packages');
+      expect(result).toContain('### Changelog');
     });
 
     it('should show major override banner in commit mode', () => {
@@ -337,7 +1134,7 @@ describe('formatPreviewComment', () => {
         labelContext: { trigger: 'label', skip: false, bumpLabel: 'minor', noBumpLabel: false },
       });
       expect(result).toContain('labeled for a **minor** release');
-      expect(result).toContain('### Packages');
+      expect(result).toContain('### Changelog');
     });
 
     it('should show patch label banner in label mode', () => {
@@ -359,7 +1156,7 @@ describe('formatPreviewComment', () => {
         labelContext: { trigger: 'label', skip: false, noBumpLabel: false, prerelease: false, stable: true },
       });
       expect(result).toContain('labeled for a **stable** release (graduation from prerelease)');
-      expect(result).toContain('### Packages');
+      expect(result).not.toContain('### Packages');
     });
 
     it('should show prerelease-only banner in label mode (conventional commits driven)', () => {
@@ -367,7 +1164,7 @@ describe('formatPreviewComment', () => {
         labelContext: { trigger: 'label', skip: false, noBumpLabel: false, prerelease: true, stable: false },
       });
       expect(result).toContain('labeled for a **prerelease** release (bump from conventional commits)');
-      expect(result).toContain('### Packages');
+      expect(result).not.toContain('### Packages');
     });
   });
 
@@ -383,9 +1180,12 @@ describe('formatPreviewComment', () => {
     };
 
     const result = formatPreviewComment(output);
-    expect(result).toContain('| `my-lib` | 1.0.0 |');
-    expect(result).not.toContain('### Changelog');
-    expect(result).toContain('- `v1.0.0`');
+    expect(result).not.toContain('### Packages');
+    expect(result).not.toContain('### Tags');
+    // Sync-bumped packages with no entries should still appear under ### Changelog
+    expect(result).toContain('### Changelog');
+    expect(result).toContain('`my-lib` → 1.0.0');
+    expect(result).toContain('sync versioning');
   });
 
   it('should handle entries with unknown types', () => {
@@ -506,6 +1306,44 @@ describe('formatPreviewComment', () => {
       expect(result).toContain('**Scope:**');
       expect(result).toContain('@wdio/native-*');
       expect(result).toContain('No bump label detected');
+    });
+  });
+
+  describe('partial-publish supersede warning', () => {
+    const warning = [
+      '> ⚠️ **Previous release v0.24.0 is partially published** (2/4 packages on the registry; no tags/GitHub release created).',
+      '> Retry it by dispatching the release workflow against the merged standing PR (#42), **or** merging this PR supersedes it — the next release re-publishes everything at the new version.',
+      '',
+    ];
+
+    it('should render the warning above the standing PR snapshot when present', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        standingPrSnapshot: snapshot,
+        supersedeWarning: warning,
+      });
+      expect(result).toContain('Previous release v0.24.0 is partially published');
+      expect(result).toContain('2/4 packages');
+      // Warning must sit before the snapshot block.
+      expect(result.indexOf('partially published')).toBeLessThan(result.indexOf('**Standing release PR:**'));
+    });
+
+    it('should omit the warning when none is supplied (failure cleared / never occurred)', () => {
+      const snapshot = snapshotFor([{ name: '@a/notes', version: '0.5.0' }]);
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'standing-pr',
+        standingPrSnapshot: snapshot,
+      });
+      expect(result).not.toContain('partially published');
+    });
+
+    it('should suppress the warning outside standing-pr strategy (defensive)', () => {
+      const result = formatPreviewComment(releaseOutput, {
+        strategy: 'direct',
+        supersedeWarning: warning,
+      });
+      expect(result).not.toContain('partially published');
     });
   });
 });

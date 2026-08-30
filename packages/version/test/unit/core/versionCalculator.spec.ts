@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Bumper, type BumperRecommendationResult } from 'conventional-recommended-bump';
+import type { ReleaseType } from 'semver';
 import semver from 'semver';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { calculateVersion } from '../../../src/core/versionCalculator.js';
@@ -49,7 +50,6 @@ describe('Version Calculator', () => {
     preset: 'angular',
     versionPrefix: 'v',
     tagTemplate: '${' + 'prefix}${' + 'version}',
-    baseBranch: 'main',
   };
 
   beforeEach(() => {
@@ -57,9 +57,8 @@ describe('Version Calculator', () => {
     vi.resetAllMocks();
 
     // Default mock implementations
-    vi.spyOn(gitRepo, 'getCurrentBranch').mockReturnValue('main');
-    vi.spyOn(gitTags, 'lastMergeBranchName').mockResolvedValue(null);
-    vi.spyOn(gitTags, 'getCommitsLength').mockReturnValue(5); // Default to 5 commits
+    vi.spyOn(gitRepo, 'getCurrentBranch').mockResolvedValue('main');
+    vi.spyOn(gitTags, 'getCommitsLength').mockResolvedValue(5); // Default to 5 commits
 
     // Set up proper mock for getVersionFromManifests
     vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockImplementation(() => {
@@ -243,16 +242,10 @@ describe('Version Calculator', () => {
     vi.restoreAllMocks();
   });
 
-  describe('Specified version type (explicit bump)', () => {
-    it('should return initial version if no latestTag and type provided', async () => {
-      // Provide specific mock for this test
-      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValueOnce({
-        version: '0.0.0',
-        manifestFound: true,
-        manifestPath: 'path/to/package.json',
-        manifestType: 'package.json',
-      });
-      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('0.1.0');
+  describe('First release (no prior tag)', () => {
+    it('should apply bump to initial version when no tag exists', async () => {
+      // No path → versionSource undefined → falls back to initialVersion ('0.1.0')
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('0.2.0');
 
       const options: VersionOptions = {
         // @ts-expect-error - Testing with null latestTag
@@ -263,10 +256,188 @@ describe('Version Calculator', () => {
 
       const version = await calculateVersion(defaultConfig as Config, options);
 
-      // Update expectation to match the mock implementation
+      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('0.1.0', 'minor', undefined);
+      expect(version).toBe('0.2.0');
+    });
+
+    it('should graduate a prerelease manifest version to stable when --stable is passed', async () => {
+      // manifest=0.1.0-next.0, stable=true, bump=minor → 0.1.0
+      vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValue({
+        source: 'package',
+        version: '0.1.0-next.0',
+        reason: 'No git tag provided',
+      });
+      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
+        version: '0.1.0-next.0',
+        manifestFound: true,
+        manifestPath: '/repo/packages/pkg/package.json',
+        manifestType: 'package.json',
+      });
+      vi.spyOn(semver, 'prerelease').mockReturnValue(['next', 0]);
+      vi.spyOn(semver, 'parse').mockReturnValue({
+        major: 0,
+        minor: 1,
+        patch: 0,
+        prerelease: ['next', 0],
+      } as unknown as semver.SemVer);
+
+      const config = { ...defaultConfig, stableOnly: true, type: 'minor' as const };
+      const options: VersionOptions = {
+        latestTag: '',
+        hasRealTag: false,
+        type: 'minor',
+        versionPrefix: 'v',
+        path: '/repo/packages/pkg',
+        name: 'my-pkg',
+      };
+
+      const version = await calculateVersion(config as Config, options);
+
       expect(version).toBe('0.1.0');
     });
 
+    it('should normalize prerelease identifier on first release when manifest has different identifier', async () => {
+      // manifest=1.0.0-rc.0, bump=major, isPrerelease=true, prereleaseIdentifier=next → 1.0.0-next.0
+      vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValue({
+        source: 'package',
+        version: '1.0.0-rc.0',
+        reason: 'No git tag provided',
+      });
+      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
+        version: '1.0.0-rc.0',
+        manifestFound: true,
+        manifestPath: '/repo/crates/pkg/Cargo.toml',
+        manifestType: 'Cargo.toml',
+      });
+      vi.spyOn(semver, 'prerelease').mockReturnValue(['rc', 0]);
+      vi.spyOn(versionUtils, 'normalizePrereleaseIdentifier').mockReturnValue('next');
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.0.0-next.0');
+
+      const config = {
+        ...defaultConfig,
+        type: 'major' as const,
+        isPrerelease: true,
+        prereleaseIdentifier: 'next',
+      };
+      const options: VersionOptions = {
+        latestTag: '',
+        hasRealTag: false,
+        type: 'major',
+        versionPrefix: 'v',
+        path: '/repo/crates/pkg',
+        name: 'my-crate',
+      };
+
+      const version = await calculateVersion(config as Config, options);
+
+      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.0.0-rc.0', 'major', 'next');
+      expect(version).toBe('1.0.0-next.0');
+    });
+
+    it('should apply major bump with prerelease identifier on first release from stable manifest', async () => {
+      // manifest=0.0.0, bump=major, isPrerelease=true, prereleaseIdentifier=next → 1.0.0-next.0
+      vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValue({
+        source: 'package',
+        version: '0.0.0',
+        reason: 'No git tag provided',
+      });
+      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
+        version: '0.0.0',
+        manifestFound: true,
+        manifestPath: '/repo/packages/pkg/package.json',
+        manifestType: 'package.json',
+      });
+      vi.spyOn(semver, 'prerelease').mockReturnValue(null);
+      vi.spyOn(versionUtils, 'normalizePrereleaseIdentifier').mockReturnValue('next');
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.0.0-next.0');
+
+      const config = {
+        ...defaultConfig,
+        type: 'major' as const,
+        isPrerelease: true,
+        prereleaseIdentifier: 'next',
+      };
+      const options: VersionOptions = {
+        latestTag: '',
+        hasRealTag: false,
+        type: 'major',
+        versionPrefix: 'v',
+        path: '/repo/packages/pkg',
+        name: 'my-pkg',
+      };
+
+      const version = await calculateVersion(config as Config, options);
+
+      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('0.0.0', 'major', 'next');
+      expect(version).toBe('1.0.0-next.0');
+    });
+
+    // A stable manifest on a first release with --stable applies the bump (1.0.0 → 2.0.0)
+    // rather than graduating, silently overshooting. The guard makes it visible/escapable without
+    // changing the resolved version.
+    function stableFirstReleaseMocks() {
+      vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValue({
+        source: 'package',
+        version: '1.0.0',
+        reason: 'No git tag provided',
+      });
+      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
+        version: '1.0.0',
+        manifestFound: true,
+        manifestPath: '/repo/packages/pkg/package.json',
+        manifestType: 'package.json',
+      });
+      vi.spyOn(semver, 'prerelease').mockReturnValue(null); // stable manifest
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('2.0.0');
+    }
+    const stableFirstReleaseOptions: VersionOptions = {
+      latestTag: '',
+      hasRealTag: false,
+      type: 'major',
+      versionPrefix: 'v',
+      path: '/repo/packages/pkg',
+      name: 'my-pkg',
+    };
+
+    it('should warn but still apply the bump on a first-release stable manifest', async () => {
+      stableFirstReleaseMocks();
+      const config = { ...defaultConfig, stableOnly: true, type: 'major' as const };
+      const version = await calculateVersion(config as Config, stableFirstReleaseOptions);
+      expect(version).toBe('2.0.0'); // resolved version is unchanged — only made visible
+      expect(logging.log).toHaveBeenCalledWith(expect.stringContaining('will publish 2.0.0, not 1.0.0'), 'warning');
+    });
+
+    it('should abort a first-release stable-manifest bump under mismatchStrategy "error"', async () => {
+      stableFirstReleaseMocks();
+      const config = { ...defaultConfig, stableOnly: true, type: 'major' as const, mismatchStrategy: 'error' as const };
+      await expect(calculateVersion(config as Config, stableFirstReleaseOptions)).rejects.toThrow(
+        /First-release version overshoot/,
+      );
+    });
+
+    it('should apply the bump silently when allowFirstBump acknowledges it', async () => {
+      stableFirstReleaseMocks();
+      const config = { ...defaultConfig, stableOnly: true, type: 'major' as const, allowFirstBump: true };
+      const version = await calculateVersion(config as Config, stableFirstReleaseOptions);
+      expect(version).toBe('2.0.0');
+      expect(logging.log).not.toHaveBeenCalledWith(expect.stringContaining('will publish 2.0.0, not 1.0.0'), 'warning');
+    });
+
+    it('should apply the bump silently under mismatchStrategy "ignore"', async () => {
+      stableFirstReleaseMocks();
+      const config = {
+        ...defaultConfig,
+        stableOnly: true,
+        type: 'major' as const,
+        mismatchStrategy: 'ignore' as const,
+      };
+      const version = await calculateVersion(config as Config, stableFirstReleaseOptions);
+      expect(version).toBe('2.0.0');
+      expect(logging.log).not.toHaveBeenCalledWith(expect.stringContaining('will publish 2.0.0, not 1.0.0'), 'warning');
+    });
+  });
+
+  describe('Specified version type (explicit bump)', () => {
     it('should increment version based on specified type', async () => {
       const options: VersionOptions = {
         latestTag: 'v1.0.0',
@@ -502,128 +673,208 @@ describe('Version Calculator', () => {
       expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.2.3', 'minor', undefined);
       expect(version).toBe('1.3.0');
     });
-  });
 
-  describe('Branch pattern versioning', () => {
-    it('should increment version based on matching branch pattern', async () => {
-      // Setup
-      const config: Partial<Config> = {
-        ...defaultConfig,
-        versionStrategy: 'branchPattern',
-        branchPattern: ['feature:minor', 'hotfix:patch'],
-      };
+    it('should correctly strip template-based package prefix from tag', async () => {
+      // Test the new dynamic template-based tag stripping
+      // Template "${packageName}@v${version}" produces tags like "wdio-native-spy@v1.0.0"
+      // The strip pattern should be "wdio-native-spy@v"
+      vi.resetAllMocks();
 
-      vi.spyOn(gitRepo, 'getCurrentBranch').mockReturnValue('feature/my-feature');
-      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.1.0');
-
-      // Execute
-      const options: VersionOptions = {
-        latestTag: 'v1.0.0',
-        versionPrefix: 'v',
-        branchPattern: config.branchPattern,
-        baseBranch: config.baseBranch,
-      };
-
-      const version = await calculateVersion(config as Config, options);
-
-      // Verify
-      expect(gitRepo.getCurrentBranch).toHaveBeenCalled();
-      expect(gitTags.lastMergeBranchName).toHaveBeenCalledWith(['feature:minor', 'hotfix:patch'], config.baseBranch);
-      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.0.0', 'minor', undefined);
-      expect(version).toBe('1.1.0');
-    });
-
-    it('should use merged branch name if available', async () => {
-      // Setup
-      const config: Partial<Config> = {
-        ...defaultConfig,
-        versionStrategy: 'branchPattern',
-        branchPattern: ['release:minor', 'hotfix:patch'],
-      };
-
-      vi.spyOn(gitRepo, 'getCurrentBranch').mockReturnValue('main');
-      vi.spyOn(gitTags, 'lastMergeBranchName').mockResolvedValue('release/1.1.0');
-      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.0.1');
-
-      // Execute
-      const options: VersionOptions = {
-        latestTag: 'v1.0.0',
-        versionPrefix: 'v',
-        branchPattern: config.branchPattern,
-        baseBranch: config.baseBranch,
-      };
-
-      const version = await calculateVersion(config as Config, options);
-
-      // Verify
-      expect(gitTags.lastMergeBranchName).toHaveBeenCalled();
-      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.0.0', 'patch', undefined);
-      expect(version).toBe('1.0.1');
-    });
-
-    it('should return empty string if no matching branch pattern found', async () => {
-      // Setup
-      const config: Partial<Config> = {
-        ...defaultConfig,
-        versionStrategy: 'branchPattern',
-        branchPattern: ['release:minor', 'hotfix:patch'],
-      };
-
-      vi.spyOn(gitRepo, 'getCurrentBranch').mockReturnValue('docs/update-readme');
-
-      // Mock conventional-commits as fallback - no commits and no release type
-      vi.spyOn(gitTags, 'getCommitsLength').mockReturnValue(0);
-      vi.spyOn(Bumper.prototype, 'bump').mockResolvedValue({} as unknown as BumperRecommendationResult);
-
-      // Execute
-      const options: VersionOptions = {
-        latestTag: 'v1.0.0',
-        versionPrefix: 'v',
-        branchPattern: config.branchPattern,
-        baseBranch: config.baseBranch,
-      };
-
-      const version = await calculateVersion(config as Config, options);
-
-      // Verify - with smart fallback, we check commits since the tag
-      expect(version).toBe('');
-      expect(logging.log).toHaveBeenCalledWith(
-        'No relevant commits found for project since v1.0.0, skipping version bump',
-        'info',
-      );
-    });
-
-    it('should use package.json version with branch pattern strategy when no latestTag exists', async () => {
-      const config: Partial<Config> = {
-        ...defaultConfig,
-        versionStrategy: 'branchPattern',
-        branchPattern: ['feature:minor'],
-      };
-
-      vi.spyOn(gitRepo, 'getCurrentBranch').mockReturnValue('feature/test');
-      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValueOnce({
-        version: '1.0.0-test',
+      // Mock semver.clean to behave like the real library
+      vi.spyOn(semver, 'clean').mockImplementation((version) => {
+        if (typeof version !== 'string') return null;
+        const match = version.match(/^v?(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?)$/);
+        return match ? match[1] : null;
+      });
+      vi.spyOn(semver, 'prerelease').mockReturnValue(null);
+      vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValue({
+        source: 'git',
+        version: 'wdio-native-spy@v1.2.3',
+        reason: 'Git tag is newer',
+      });
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.3.0');
+      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
+        version: '1.2.3',
         manifestFound: true,
-        manifestPath: 'path/to/package.json',
+        manifestPath: '/repo/packages/native-spy/package.json',
         manifestType: 'package.json',
       });
-      vi.spyOn(semver, 'prerelease').mockReturnValue(['test']);
-      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.1.0');
+
+      const config: Partial<Config> = {
+        ...defaultConfig,
+        tagTemplate: '${packageName}@v${version}',
+        packageSpecificTags: true,
+      };
 
       const options: VersionOptions = {
-        latestTag: '',
+        latestTag: 'wdio-native-spy@v1.2.3',
+        hasRealTag: true,
         versionPrefix: 'v',
-        branchPattern: config.branchPattern,
+        path: '/repo/packages/native-spy',
+        name: '@wdio/native-spy',
+        type: 'minor',
       };
 
       const version = await calculateVersion(config as Config, options);
 
-      // Should read from package.json and clean prerelease identifier for minor bump
-      expect(version).toBe('1.1.0');
+      // Version must be extracted from the tag correctly using the template-based pattern
+      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.2.3', 'minor', undefined);
+      expect(version).toBe('1.3.0');
+    });
+
+    it('should fall back to hardcoded patterns when tagTemplate does not include packageName', async () => {
+      // Test that templates without ${packageName} still use the fallback hardcoded patterns
+      // This ensures backward compatibility for configs that have tagTemplate but don't include package names
+      vi.resetAllMocks();
+
+      // Mock semver.clean to behave like the real library
+      vi.spyOn(semver, 'clean').mockImplementation((version) => {
+        if (typeof version !== 'string') return null;
+        const match = version.match(/^v?(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?)$/);
+        return match ? match[1] : null;
+      });
+      vi.spyOn(semver, 'prerelease').mockReturnValue(null);
+      vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValue({
+        source: 'git',
+        version: 'scope-pkg-v1.2.3', // Tag in the format that hardcoded patterns expect
+        reason: 'Git tag is newer',
+      });
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.3.0');
+      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
+        version: '1.2.3',
+        manifestFound: true,
+        manifestPath: '/repo/packages/pkg/package.json',
+        manifestType: 'package.json',
+      });
+
+      // Template without ${packageName} - should use hardcoded patterns
+      const config: Partial<Config> = {
+        ...defaultConfig,
+        tagTemplate: '${prefix}${version}', // No ${packageName}, just prefix + version
+        packageSpecificTags: true,
+      };
+
+      const options: VersionOptions = {
+        latestTag: 'scope-pkg-v1.2.3',
+        hasRealTag: true,
+        versionPrefix: 'v',
+        path: '/repo/packages/pkg',
+        name: '@scope/pkg',
+        type: 'minor',
+      };
+
+      const version = await calculateVersion(config as Config, options);
+
+      // Should still work with hardcoded pattern fallback
+      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.2.3', 'minor', undefined);
+      expect(version).toBe('1.3.0');
+    });
+
+    it('should strip a multi-segment baselineTagTemplate prefix from latestTag', async () => {
+      // Reproduces the regression where a baseline tag like `release/v0.21.0` falls through
+      // the strip regex (which only knew about the consumer prefix `v`) and semver.clean
+      // returns null, leaving the version source as '0.0.0' and the bump producing 0.1.0
+      // instead of 0.22.0.
+      vi.resetAllMocks();
+      vi.spyOn(semver, 'clean').mockImplementation((version) => {
+        if (typeof version !== 'string') return null;
+        const match = version.match(/^v?(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?)$/);
+        return match ? match[1] : null;
+      });
+      vi.spyOn(semver, 'prerelease').mockReturnValue(null);
+      vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValue({
+        source: 'git',
+        version: 'release/v0.21.0',
+        reason: 'Git tag reachable',
+      });
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('0.22.0');
+      vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
+        version: '0.21.0',
+        manifestFound: true,
+        manifestPath: '/repo/package.json',
+        manifestType: 'package.json',
+      });
+
+      const config: Partial<Config> = {
+        ...defaultConfig,
+        tagTemplate: '${prefix}${version}',
+        baselineTagTemplate: 'release/${prefix}${version}',
+      };
+
+      const options: VersionOptions = {
+        latestTag: 'release/v0.21.0',
+        hasRealTag: true,
+        versionPrefix: 'v',
+        path: '/repo',
+        type: 'minor',
+      };
+
+      const version = await calculateVersion(config as Config, options);
+
+      // The strip regex must extract 0.21.0 from `release/v0.21.0` so the bump runs from
+      // the right base.
+      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('0.21.0', 'minor', undefined);
+      expect(version).toBe('0.22.0');
     });
   });
 
   describe('Conventional commits analysis', () => {
+    it('should call Bumper.commits with baseRef when config.baseRef is set', async () => {
+      const commitsSpy = vi.spyOn(Bumper.prototype, 'commits').mockReturnThis();
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.0.1');
+
+      const config = { ...defaultConfig, baseRef: 'deadbeef123' } as Config;
+      const options: VersionOptions = { latestTag: 'v1.0.0', versionPrefix: 'v' };
+
+      await calculateVersion(config, options);
+
+      expect(commitsSpy).toHaveBeenCalledWith({ from: 'deadbeef123' });
+    });
+
+    it('should bound the bumper to latestTag when baseRef is absent and the tag exists', async () => {
+      // Regression: without baseRef the scan must still be bounded to the last release
+      // tag. Otherwise conventional-recommended-bump scans the entire history and historical feats
+      // inflate the bump magnitude (a docs-only window bumps minor instead of patch).
+      const commitsSpy = vi.spyOn(Bumper.prototype, 'commits').mockReturnThis();
+      vi.spyOn(gitTags, 'refExists').mockReturnValue(true);
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.0.1');
+
+      const options: VersionOptions = { latestTag: 'v1.0.0', versionPrefix: 'v' };
+
+      await calculateVersion(defaultConfig as Config, options);
+
+      expect(commitsSpy).toHaveBeenCalledWith({ from: 'v1.0.0' });
+    });
+
+    it('should bound the bumper to a multi-segment baseline tag when baseRef is absent', async () => {
+      // Mirrors the standing-PR / sync shape that surfaced the regression: the baseline tag carries the
+      // `baselineTagTemplate` prefix (e.g. `release/v0.29.0`), which must still bound the scan.
+      const commitsSpy = vi.spyOn(Bumper.prototype, 'commits').mockReturnThis();
+      vi.spyOn(gitTags, 'refExists').mockReturnValue(true);
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('0.29.1');
+
+      const config = { ...defaultConfig, baselineTagTemplate: 'release/${prefix}${version}' } as Config;
+      const options: VersionOptions = { latestTag: 'release/v0.29.0', versionPrefix: 'v' };
+
+      await calculateVersion(config, options);
+
+      expect(commitsSpy).toHaveBeenCalledWith({ from: 'release/v0.29.0' });
+    });
+
+    it('should leave the bumper unbounded when baseRef is absent and latestTag does not resolve', async () => {
+      // An absent/unreachable tag falls back to the unbounded default rather than throwing,
+      // mirroring the changelog path's rev-parse guard.
+      const commitsSpy = vi.spyOn(Bumper.prototype, 'commits').mockReturnThis();
+      vi.spyOn(gitTags, 'refExists').mockReturnValue(false);
+      vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.0.1');
+
+      const options: VersionOptions = { latestTag: 'v1.0.0', versionPrefix: 'v' };
+
+      await calculateVersion(defaultConfig as Config, options);
+
+      expect(commitsSpy).not.toHaveBeenCalled();
+    });
+
     it('should use conventional commits when no type or branch pattern matches', async () => {
       // Setup specific mocks
       vi.spyOn(Bumper.prototype, 'loadPreset').mockImplementation(() => {
@@ -652,7 +903,7 @@ describe('Version Calculator', () => {
 
     it('should return empty string if no commits since last tag', async () => {
       // Mock getCommitsLength to return 0 for this test
-      vi.spyOn(gitTags, 'getCommitsLength').mockReturnValue(0);
+      vi.spyOn(gitTags, 'getCommitsLength').mockResolvedValue(0);
 
       // Mock getBestVersionSource for this test
       vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValueOnce({
@@ -714,6 +965,116 @@ describe('Version Calculator', () => {
     });
   });
 
+  describe('Pre-1.0 breaking changes (zeroMajor)', () => {
+    // Helper: drive the commit-inferred path with a given inferred release type and current version.
+    function setupInferred(releaseType: ReleaseType, currentVersion: string): void {
+      vi.spyOn(Bumper.prototype, 'bump').mockResolvedValue({
+        releaseType,
+      } as unknown as BumperRecommendationResult);
+      vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValue({
+        source: 'git',
+        version: `v${currentVersion}`,
+        reason: 'Git tag exists',
+      });
+    }
+
+    it('should bump the 0.x minor for an inferred breaking change under the default (0.24.0 -> 0.25.0)', async () => {
+      setupInferred('major', '0.24.0');
+      const bumpSpy = vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('0.25.0');
+
+      const version = await calculateVersion(defaultConfig as Config, {
+        latestTag: 'v0.24.0',
+        versionPrefix: 'v',
+      });
+
+      // The inferred 'major' is downgraded to 'minor' before bumpVersion is called.
+      expect(bumpSpy).toHaveBeenCalledWith('0.24.0', 'minor', undefined);
+      expect(version).toBe('0.25.0');
+    });
+
+    it('should bump to the next major for an inferred breaking change at/after 1.0.0 (1.2.0 -> 2.0.0)', async () => {
+      setupInferred('major', '1.2.0');
+      const bumpSpy = vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('2.0.0');
+
+      const version = await calculateVersion(defaultConfig as Config, {
+        latestTag: 'v1.2.0',
+        versionPrefix: 'v',
+      });
+
+      // major >= 1 is unaffected by the downgrade.
+      expect(bumpSpy).toHaveBeenCalledWith('1.2.0', 'major', undefined);
+      expect(version).toBe('2.0.0');
+    });
+
+    it("should bump to 1.0.0 for an inferred breaking change pre-1.0 when zeroMajor is 'strict'", async () => {
+      setupInferred('major', '0.24.0');
+      const bumpSpy = vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.0.0');
+
+      const config = { ...defaultConfig, zeroMajor: 'strict' } as Config;
+      const version = await calculateVersion(config, {
+        latestTag: 'v0.24.0',
+        versionPrefix: 'v',
+      });
+
+      // strict preserves the current/semantic-release behavior: breaking -> major even pre-1.0.
+      expect(bumpSpy).toHaveBeenCalledWith('0.24.0', 'major', undefined);
+      expect(version).toBe('1.0.0');
+    });
+
+    it('should NOT downgrade an explicit major bump pre-1.0 (specifiedType: major on 0.24.0 -> 1.0.0)', async () => {
+      // The explicit (specifiedType) branch must stay untouched by the fix and the config.
+      vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValue({
+        source: 'git',
+        version: 'v0.24.0',
+        reason: 'Git tag exists',
+      });
+      const bumpSpy = vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.0.0');
+
+      const version = await calculateVersion(defaultConfig as Config, {
+        latestTag: 'v0.24.0',
+        type: 'major',
+        versionPrefix: 'v',
+      });
+
+      expect(bumpSpy).toHaveBeenCalledWith('0.24.0', 'major', undefined);
+      expect(version).toBe('1.0.0');
+    });
+
+    it('should leave an inferred feat (minor) untouched pre-1.0 (0.24.0 -> 0.25.0, not 0.24.1)', async () => {
+      setupInferred('minor', '0.24.0');
+      const bumpSpy = vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('0.25.0');
+
+      const version = await calculateVersion(defaultConfig as Config, {
+        latestTag: 'v0.24.0',
+        versionPrefix: 'v',
+      });
+
+      // Decision: feat->minor is NOT downgraded to patch pre-1.0; only the irreversible
+      // breaking->major (1.0.0) jump is corrected.
+      expect(bumpSpy).toHaveBeenCalledWith('0.24.0', 'minor', undefined);
+      expect(version).toBe('0.25.0');
+    });
+
+    it('should downgrade an inferred breaking change to minor pre-1.0 in the prerelease flow (0.24.0 -> 0.25.0-next.0)', async () => {
+      // conventional-recommended-bump returns 'major' for a breaking change; the prerelease
+      // flow is driven by config.isPrerelease, which makes bumpVersion turn the downgraded
+      // 'minor' + identifier into the preminor-shaped 0.25.0-next.0.
+      setupInferred('major', '0.24.0');
+      const bumpSpy = vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('0.25.0-next.0');
+
+      const config = { ...defaultConfig, isPrerelease: true, prereleaseIdentifier: 'next' } as Config;
+      const version = await calculateVersion(config, {
+        latestTag: 'v0.24.0',
+        versionPrefix: 'v',
+      });
+
+      // 'major' downgraded to 'minor'; the prerelease identifier is threaded through so
+      // bumpVersion emits the preminor-shaped 0.25.0-next.0.
+      expect(bumpSpy).toHaveBeenCalledWith('0.24.0', 'minor', 'next');
+      expect(version).toBe('0.25.0-next.0');
+    });
+  });
+
   describe('Error handling', () => {
     it('should rethrow errors during conventional bump calculation', async () => {
       vi.spyOn(Bumper.prototype, 'bump').mockRejectedValue(new Error('Failed to analyze commits'));
@@ -745,7 +1106,7 @@ describe('Version Calculator', () => {
     });
   });
 
-  describe('Package.json fallback when no tags found', () => {
+  describe('First release scenarios', () => {
     beforeEach(() => {
       // Reset mocks before each test
       vi.resetAllMocks();
@@ -822,8 +1183,8 @@ describe('Version Calculator', () => {
       vi.clearAllMocks();
     });
 
-    it('should use package.json version when no latestTag exists with explicit bump', async () => {
-      // Mock both functions properly
+    it('should apply bump to manifest version for first release with explicit bump', async () => {
+      // After the fix: first release no longer returns manifest verbatim; bump is applied.
       vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
         version: '1.0.0-beta.1',
         manifestFound: true,
@@ -846,12 +1207,13 @@ describe('Version Calculator', () => {
 
       const version = await calculateVersion(defaultConfig as Config, options);
 
+      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.0.0-beta.1', 'major', undefined);
       expect(version).toBe('2.0.0');
       expect(logging.log).toHaveBeenCalledWith(expect.stringContaining('Using version source: package'), 'info');
     });
 
-    it('should correctly handle major bump on 1.0.0-next.0', async () => {
-      // Mock both dependencies properly
+    it('should apply bump to prerelease manifest version on first release', async () => {
+      // After the fix: bump is applied to the manifest version as the base.
       vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
         version: '1.0.0-next.0',
         manifestFound: true,
@@ -877,11 +1239,12 @@ describe('Version Calculator', () => {
       };
 
       const version = await calculateVersion(config as Config, options);
+      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.0.0-next.0', 'major', undefined);
       expect(version).toBe('2.0.0');
     });
 
-    it('should attempt to use package.json version with conventional commits when no latestTag exists', async () => {
-      // Mock both dependencies properly
+    it('should apply bump to stable manifest version on first release', async () => {
+      // After the fix: bump is applied even when the manifest is already stable.
       vi.spyOn(manifestHelpers, 'getVersionFromManifests').mockReturnValue({
         version: '1.0.0',
         manifestFound: true,
@@ -893,6 +1256,7 @@ describe('Version Calculator', () => {
         version: '1.0.0',
         reason: 'No git tag provided',
       });
+      vi.spyOn(semver, 'prerelease').mockReturnValue(null);
       vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.0.1');
 
       const config: Partial<Config> = {
@@ -907,6 +1271,7 @@ describe('Version Calculator', () => {
       };
 
       const version = await calculateVersion(config as Config, options);
+      expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.0.0', 'patch', undefined);
       expect(version).toBe('1.0.1');
     });
 
@@ -1120,8 +1485,8 @@ describe('Version Calculator', () => {
       expect(version).toBe('1.2.1'); // Will be bumped from 1.2.0 to 1.2.1
     });
 
-    it('should not warn when no tags exist (hasNoTags is true)', async () => {
-      // Mock getBestVersionSource for this test
+    it('should apply bump to package.json version for first release when hasNoTags is true', async () => {
+      // After the fix: first release applies bump/stable/prerelease logic, not verbatim.
       vi.spyOn(versionUtils, 'getBestVersionSource').mockResolvedValueOnce({
         source: 'package',
         version: '1.0.0',
@@ -1130,7 +1495,7 @@ describe('Version Calculator', () => {
 
       const config: Partial<Config> = {
         ...defaultConfig,
-        type: 'patch', // Explicitly specify type to bypass conventional commits
+        type: 'patch',
       };
 
       const options: VersionOptions = {
@@ -1140,7 +1505,7 @@ describe('Version Calculator', () => {
       };
 
       const version = await calculateVersion(config as Config, options);
-      expect(version).toBe('1.0.1'); // Will be bumped from 1.0.0 to 1.0.1
+      expect(version).toBe('1.0.1');
     });
 
     it('should not warn when no manifest is found', async () => {
@@ -1290,65 +1655,9 @@ describe('Version Calculator', () => {
         expect(result).toBe('1.0.0');
       });
     });
-
-    describe('branch pattern with prerelease logic', () => {
-      it('should NOT use prereleaseIdentifier for branch patterns unless isPrerelease is true', async () => {
-        const config: Partial<Config> = {
-          ...defaultConfig,
-          prereleaseIdentifier: 'next',
-          branchPattern: ['feature:minor'],
-          baseBranch: 'main',
-          // isPrerelease: undefined - NOT explicitly requested
-        };
-
-        const options: VersionOptions = {
-          latestTag: 'v1.0.0',
-          versionPrefix: 'v',
-          path: '/test',
-          branchPattern: config.branchPattern,
-          baseBranch: config.baseBranch,
-        };
-
-        // Mock branch matching
-        vi.spyOn(gitRepo, 'getCurrentBranch').mockReturnValue('feature/test-branch');
-
-        const _result = await calculateVersion(config as Config, options);
-
-        // Should use stable version for branch pattern
-        expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.0.0', 'minor', undefined);
-      });
-
-      it('should use prereleaseIdentifier for branch patterns when isPrerelease is true', async () => {
-        const config: Partial<Config> = {
-          ...defaultConfig,
-          prereleaseIdentifier: 'next',
-          branchPattern: ['feature:minor'],
-          baseBranch: 'main',
-          isPrerelease: true, // Explicitly requested
-        };
-
-        const options: VersionOptions = {
-          latestTag: 'v1.0.0',
-          versionPrefix: 'v',
-          path: '/test',
-          branchPattern: config.branchPattern,
-          baseBranch: config.baseBranch,
-        };
-
-        // Mock branch matching
-        vi.spyOn(gitRepo, 'getCurrentBranch').mockReturnValue('feature/test-branch');
-        vi.spyOn(versionUtils, 'bumpVersion').mockReturnValue('1.1.0-next.0');
-
-        const result = await calculateVersion(config as Config, options);
-
-        // Should use prerelease version for branch pattern
-        expect(versionUtils.bumpVersion).toHaveBeenCalledWith('1.0.0', 'minor', 'next');
-        expect(result).toBe('1.1.0-next.0');
-      });
-    });
   });
 
-  describe('stableOnly mode (release:stable without bump label)', () => {
+  describe('stableOnly mode (release:graduate without bump label)', () => {
     it('should graduate a prerelease package to its stable base version', async () => {
       const config: Partial<Config> = {
         ...defaultConfig,
@@ -1380,7 +1689,7 @@ describe('Version Calculator', () => {
       const config: Partial<Config> = {
         ...defaultConfig,
         stableOnly: true,
-        // No type — release:stable alone, no bump:* label
+        // No type — release:graduate alone, no bump:* label
       };
 
       const options: VersionOptions = {
@@ -1397,7 +1706,7 @@ describe('Version Calculator', () => {
       expect(versionUtils.bumpVersion).not.toHaveBeenCalled();
     });
 
-    it('should apply bump label to an already-stable package (release:stable + bump:minor)', async () => {
+    it('should apply bump label to an already-stable package (release:graduate + bump:minor)', async () => {
       const config: Partial<Config> = {
         ...defaultConfig,
         stableOnly: true,
@@ -1467,7 +1776,7 @@ describe('Version Calculator', () => {
         prerelease: ['beta', 3],
       } as unknown as semver.SemVer);
       // Zero commits — graduation still proceeds
-      vi.spyOn(gitTags, 'getCommitsLength').mockReturnValue(0);
+      vi.spyOn(gitTags, 'getCommitsLength').mockResolvedValue(0);
 
       const result = await calculateVersion(config as Config, options);
 

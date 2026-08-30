@@ -6,6 +6,7 @@ export interface ExecOptions {
   env?: Record<string, string | undefined>;
   dryRun?: boolean;
   label?: string;
+  timeout?: number; // timeout in milliseconds
 }
 
 export interface ExecResult {
@@ -39,7 +40,7 @@ export async function execCommand(file: string, args: string[], options: ExecOpt
   debug(`Executing: ${displayCommand}`);
 
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       file,
       args,
       {
@@ -54,6 +55,9 @@ export async function execCommand(file: string, args: string[], options: ExecOpt
               stdout: stdout.toString(),
               stderr: stderr.toString(),
               exitCode: error.code ?? 1,
+              // Preserve the spawn error code (e.g. 'ENOENT' when the binary isn't on PATH) so
+              // callers can distinguish "command not found" from a non-zero exit.
+              code: (error as NodeJS.ErrnoException).code,
             }),
           );
         } else {
@@ -65,7 +69,33 @@ export async function execCommand(file: string, args: string[], options: ExecOpt
         }
       },
     );
+
+    // Handle timeout
+    if (options.timeout !== undefined) {
+      const timer = setTimeout(() => {
+        child.kill('SIGTERM');
+        reject(
+          Object.assign(new Error(`Command timed out after ${options.timeout}ms`), {
+            stdout: '',
+            stderr: '',
+            exitCode: 1,
+          }),
+        );
+      }, options.timeout);
+
+      child.on('exit', () => clearTimeout(timer));
+      child.on('error', () => clearTimeout(timer));
+    }
   });
+}
+
+/**
+ * Combine an exec error's message, stdout, and stderr into a single string for pattern matching.
+ */
+export function getExecErrorOutput(error: unknown): string {
+  if (!error || typeof error !== 'object') return String(error);
+  const e = error as { message?: string; stdout?: string; stderr?: string };
+  return [e.message, e.stdout, e.stderr].filter(Boolean).join('\n');
 }
 
 /**

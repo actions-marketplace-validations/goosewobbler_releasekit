@@ -1,4 +1,5 @@
 import type { VersionOutput } from '@releasekit/core';
+import { FakeGit } from '@releasekit/git';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ReleaseOptions } from '../../src/types.js';
 
@@ -6,22 +7,40 @@ import type { ReleaseOptions } from '../../src/types.js';
 
 const mockLoadReleaseKitConfig = vi.fn();
 const mockLoadCIConfig = vi.fn();
-const mockCreateOctokit = vi.fn();
+const mockForgeFor = vi.fn();
 const mockFindMergedPRsForCommit = vi.fn();
 const mockFetchPRLabels = vi.fn();
+const mockRefreshFeederPreviews = vi.fn();
+
+vi.mock('../../src/preview/refresh.js', () => ({
+  refreshFeederPreviews: (...args: unknown[]) => mockRefreshFeederPreviews(...args),
+  runRefreshAfterRelease: vi.fn(),
+}));
 
 vi.mock('@releasekit/config', () => ({
   loadConfig: (...args: unknown[]) => ({ ...mockLoadReleaseKitConfig(...args), ci: mockLoadCIConfig() }),
 }));
 
-vi.mock('node:child_process', () => ({
-  execSync: vi.fn().mockReturnValue('feat: some feature\n'),
-}));
+// The git seam backs `getHeadCommitMessage` (the skip-pattern guard's HEAD-subject read). A fresh
+// FakeGit per test, seeded via `gitCommits` (the `'*'` catch-all), drives `log({ format: '%s' })`.
+let fakeGit: FakeGit;
+let gitLogSpy: ReturnType<typeof vi.spyOn> | undefined;
+function setGitSubject(subject: string) {
+  fakeGit = new FakeGit({ commits: { '*': `${subject}\n` } });
+  gitLogSpy = vi.spyOn(fakeGit, 'log');
+}
+vi.mock('@releasekit/git', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@releasekit/git')>();
+  return { ...actual, createGitCli: () => fakeGit };
+});
 
-vi.mock('../../src/preview-github.js', () => ({
-  createOctokit: (...args: unknown[]) => mockCreateOctokit(...args),
+vi.mock('../../src/github.js', () => ({
+  forgeFor: (...args: unknown[]) => mockForgeFor(...args),
   findMergedPRsForCommit: (...args: unknown[]) => mockFindMergedPRsForCommit(...args),
   fetchPRLabels: (...args: unknown[]) => mockFetchPRLabels(...args),
+  // Used by the best-effort failure-report resolve path; a plain stub keeps it quiet.
+  findPreviewComment: vi.fn().mockResolvedValue(null),
+  postOrUpdateComment: vi.fn().mockResolvedValue(undefined),
 }));
 
 const mockEnableJsonOutput = vi.fn();
@@ -69,10 +88,16 @@ vi.mock('@releasekit/notes', () => ({
 const mockPublishRunPipeline = vi.fn();
 const mockPublishLoadConfig = vi.fn();
 
-vi.mock('@releasekit/publish', () => ({
-  runPipeline: (...args: unknown[]) => mockPublishRunPipeline(...args),
-  loadConfig: (...args: unknown[]) => mockPublishLoadConfig(...args),
-}));
+vi.mock('@releasekit/publish', async (importOriginal) => {
+  // Pull the real PipelineError through so release.ts's `instanceof PipelineError` check works;
+  // only runPipeline/loadConfig are stubbed.
+  const actual = await importOriginal<typeof import('@releasekit/publish')>();
+  return {
+    PipelineError: actual.PipelineError,
+    runPipeline: (...args: unknown[]) => mockPublishRunPipeline(...args),
+    loadConfig: (...args: unknown[]) => mockPublishLoadConfig(...args),
+  };
+});
 
 vi.mock('@releasekit/core', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@releasekit/core')>();
@@ -102,6 +127,7 @@ const defaultOptions: ReleaseOptions = {
   verbose: false,
   quiet: false,
   projectDir: '/test/project',
+  target: '@test/package',
 };
 
 const versionOutputWithChanges: VersionOutput = {
@@ -150,8 +176,11 @@ describe('runRelease', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
 
+    // Default HEAD subject is a non-release commit so the skip-pattern guard passes.
+    setGitSubject('feat: some feature');
+
     // Default mock setup
-    mockCreateOctokit.mockReturnValue({});
+    mockForgeFor.mockReturnValue({});
     mockFindMergedPRsForCommit.mockResolvedValue([]);
     mockFetchPRLabels.mockResolvedValue([]);
     mockLoadReleaseKitConfig.mockReturnValue({});
@@ -436,7 +465,7 @@ describe('runRelease', () => {
   it('should pass dryRun to notes pipeline', async () => {
     await runRelease({ ...defaultOptions, dryRun: true });
 
-    expect(mockNotesRunPipeline).toHaveBeenCalledWith(expect.anything(), expect.anything(), true);
+    expect(mockNotesRunPipeline).toHaveBeenCalledWith(expect.anything(), expect.anything(), true, expect.anything());
   });
 
   it('should pass version output to notes directly', async () => {
@@ -515,8 +544,7 @@ describe('runRelease', () => {
 
   describe('release config: skipPatterns', () => {
     it('should return null when HEAD commit matches a skip pattern', async () => {
-      const { execSync } = await import('node:child_process');
-      vi.mocked(execSync).mockReturnValue('chore(deps): bump some-dep from 1.0.0 to 2.0.0\n' as never);
+      setGitSubject('chore(deps): bump some-dep from 1.0.0 to 2.0.0');
       mockLoadReleaseKitConfig.mockReturnValue({ release: { ci: { skipPatterns: ['chore(deps):'] } } });
 
       const result = await runRelease(defaultOptions);
@@ -526,8 +554,7 @@ describe('runRelease', () => {
     });
 
     it('should continue when HEAD commit does not match any skip pattern', async () => {
-      const { execSync } = await import('node:child_process');
-      vi.mocked(execSync).mockReturnValue('feat: add new feature\n' as never);
+      setGitSubject('feat: add new feature');
       mockLoadReleaseKitConfig.mockReturnValue({ release: { ci: { skipPatterns: ['chore(deps):'] } } });
 
       const result = await runRelease(defaultOptions);
@@ -545,10 +572,9 @@ describe('runRelease', () => {
     });
 
     it('should continue when git log fails', async () => {
-      const { execSync } = await import('node:child_process');
-      vi.mocked(execSync).mockImplementation(() => {
-        throw new Error('not a git repo');
-      });
+      // getHeadCommitMessage swallows a git failure and returns null → the guard is skipped.
+      setGitSubject('feat: ignored');
+      vi.spyOn(fakeGit, 'log').mockRejectedValue(new Error('not a git repo'));
       mockLoadReleaseKitConfig.mockReturnValue({ release: { ci: { skipPatterns: ['chore(deps):'] } } });
 
       const result = await runRelease(defaultOptions);
@@ -557,15 +583,12 @@ describe('runRelease', () => {
     });
 
     it('should pass projectDir as cwd to git log', async () => {
-      const { execSync } = await import('node:child_process');
       mockLoadReleaseKitConfig.mockReturnValue({ release: { ci: { skipPatterns: ['chore(deps):'] } } });
 
       await runRelease({ ...defaultOptions, projectDir: '/custom/project' });
 
-      expect(execSync).toHaveBeenCalledWith(
-        'git log -1 --pretty=%s',
-        expect.objectContaining({ cwd: '/custom/project' }),
-      );
+      // getHeadCommitMessage reads the HEAD subject via `log({ format: '%s' })`, scoped to projectDir.
+      expect(gitLogSpy).toHaveBeenCalledWith(expect.objectContaining({ format: '%s', cwd: '/custom/project' }));
     });
   });
 
@@ -701,6 +724,34 @@ describe('runRelease', () => {
       expect(result).not.toBeNull();
     });
 
+    it('should skip scope label check for workflow_dispatch event', async () => {
+      // Set GITHUB_EVENT_NAME explicitly to workflow_dispatch before the test
+      const originalEventName = process.env.GITHUB_EVENT_NAME;
+      process.env.GITHUB_EVENT_NAME = 'workflow_dispatch';
+
+      try {
+        mockLoadCIConfig.mockReturnValue({
+          scopeLabels: {
+            'scope:all': '@releasekit/*',
+          },
+        });
+
+        const { runRelease } = await import('../../src/release.js');
+        const result = await runRelease(defaultOptions);
+
+        // workflow_dispatch should not query for merged PRs at all
+        expect(mockFindMergedPRsForCommit).not.toHaveBeenCalled();
+        expect(result).not.toBeNull();
+      } finally {
+        // Restore original value
+        if (originalEventName !== undefined) {
+          process.env.GITHUB_EVENT_NAME = originalEventName;
+        } else {
+          delete process.env.GITHUB_EVENT_NAME;
+        }
+      }
+    });
+
     it('should not block release when no scopeLabels configured and no conflicts', async () => {
       mockLoadCIConfig.mockReturnValue({});
       mockFindMergedPRsForCommit.mockResolvedValue([123]);
@@ -716,7 +767,7 @@ describe('runRelease', () => {
     it('should block release when prerelease + stable conflict detected without scopeLabels', async () => {
       mockLoadCIConfig.mockReturnValue({});
       mockFindMergedPRsForCommit.mockResolvedValue([123]);
-      mockFetchPRLabels.mockResolvedValue(['release:stable', 'release:prerelease']);
+      mockFetchPRLabels.mockResolvedValue(['release:graduate', 'channel:prerelease']);
 
       const { runRelease } = await import('../../src/release.js');
       const result = await runRelease(defaultOptions);
@@ -731,7 +782,7 @@ describe('runRelease', () => {
         },
       });
       mockFindMergedPRsForCommit.mockResolvedValue([123]);
-      mockFetchPRLabels.mockResolvedValue(['scope:shared', 'release:stable', 'release:prerelease']);
+      mockFetchPRLabels.mockResolvedValue(['scope:shared', 'release:graduate', 'channel:prerelease']);
 
       const { runRelease } = await import('../../src/release.js');
       const result = await runRelease(defaultOptions);
@@ -802,7 +853,7 @@ describe('runRelease', () => {
         },
       });
       mockFindMergedPRsForCommit.mockResolvedValue([123]);
-      mockFetchPRLabels.mockResolvedValue(['release:stable', 'release:prerelease']);
+      mockFetchPRLabels.mockResolvedValue(['release:graduate', 'channel:prerelease']);
 
       const { runRelease } = await import('../../src/release.js');
       const result = await runRelease({ ...defaultOptions, dryRun: true });
@@ -817,7 +868,6 @@ describe('runRelease', () => {
           'scope:electron': '@wdio/electron-*',
           'scope:shared': '@wdio/native-*',
         },
-        defaultScope: 'scope:shared',
       });
       mockFindMergedPRsForCommit.mockResolvedValue([123]);
       mockFetchPRLabels.mockResolvedValue(['scope:electron']);
@@ -929,6 +979,35 @@ describe('runRelease', () => {
           'scope:electron': '@wdio/electron-*',
         }),
       ).toThrow('Scope "unknown" not found in ci.scopeLabels. Available: scope:electron');
+    });
+  });
+
+  describe('feeder-preview refresh', () => {
+    it('should refresh feeder previews in-process after a successful release', async () => {
+      await runRelease(defaultOptions);
+      expect(mockRefreshFeederPreviews).toHaveBeenCalledWith(expect.objectContaining({ projectDir: '/test/project' }));
+    });
+
+    it('should not refresh feeder previews on a dry run', async () => {
+      await runRelease({ ...defaultOptions, dryRun: true });
+      expect(mockRefreshFeederPreviews).not.toHaveBeenCalled();
+    });
+
+    it('should not refresh feeder previews when publish is skipped', async () => {
+      await runRelease({ ...defaultOptions, skipPublish: true });
+      expect(mockRefreshFeederPreviews).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('editedNotes (manual-mode draft dispatch)', () => {
+    it('should merge editedNotes over generated notes before publish (edited wins per package)', async () => {
+      await runRelease({ ...defaultOptions, editedNotes: { 'test-pkg': '- edited by human' } });
+
+      // runPublishStep forwards releaseNotes as the 3rd positional to the publish pipeline.
+      const publishOptions = vi.mocked(mockPublishRunPipeline).mock.calls[0]?.[2] as {
+        releaseNotes?: Record<string, string>;
+      };
+      expect(publishOptions.releaseNotes).toMatchObject({ 'test-pkg': '- edited by human' });
     });
   });
 });

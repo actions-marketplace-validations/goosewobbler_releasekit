@@ -1,15 +1,19 @@
 import type { ChangelogEntry } from '../../core/types.js';
 import type { LLMProvider, SummarizeContext } from '../index.js';
-import { resolvePrompt } from '../prompts.js';
+import type { LLMMessage } from '../messages.js';
+import { resolveSystemPrompt } from '../prompts.js';
+import { INSTRUCTION_HIERARCHY, renderEntries } from './shared.js';
 
-const DEFAULT_SUMMARIZE_PROMPT = `You are creating a summary of changes for a software release.
+export const DEFAULT_SYSTEM_PROMPT = `You are creating a summary of changes for a software release.
+Create a brief summary (2-3 sentences) that captures the main themes of this release.
 
-Given the following changelog entries, create a brief summary (2-3 sentences) that captures the main themes of this release.
+${INSTRUCTION_HIERARCHY}
 
-Entries:
-{{entries}}
+Output only the summary text, nothing else.`;
 
-Summary (only output the summary, nothing else):`;
+function buildUserPrompt(entries: ChangelogEntry[]): string {
+  return `Entries:\n${renderEntries(entries)}`;
+}
 
 export async function summarizeEntries(
   provider: LLMProvider,
@@ -20,12 +24,13 @@ export async function summarizeEntries(
     return '';
   }
 
-  const entriesText = entries.map((e) => `- [${e.type}]${e.scope ? ` (${e.scope})` : ''}: ${e.description}`).join('\n');
+  const systemPrompt = resolveSystemPrompt('summarize', DEFAULT_SYSTEM_PROMPT, context.prompts);
 
-  const defaultPrompt = DEFAULT_SUMMARIZE_PROMPT.replace('{{entries}}', entriesText);
-  const prompt = resolvePrompt('summarize', defaultPrompt, context.prompts);
+  const messages: LLMMessage[] = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: buildUserPrompt(entries) },
+  ];
 
-  const response = await provider.complete(prompt);
-
-  return response.trim();
+  const result = await provider.complete(messages);
+  return result.content.trim();
 }

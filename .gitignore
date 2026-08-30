@@ -42,3 +42,11 @@ build
 
 # Vitest
 .vitest
+
+# Claude Code local state
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+packages/*/releasekit-*.tgz
+
+# Agent worktrees
+.claude/worktrees/

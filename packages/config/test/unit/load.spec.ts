@@ -69,11 +69,62 @@ describe('loadConfig', () => {
     mockedFs.existsSync.mockReturnValue(true);
     mockedFs.readFileSync.mockReturnValue(
       JSON.stringify({
-        version: { versionStrategy: 'invalid-strategy' },
+        version: { zeroMajor: 'invalid-strategy' },
       }),
     );
 
     expect(() => loadConfig()).toThrow(ConfigError);
+  });
+
+  it('should throw a migration error for the removed notes.releaseNotes.mode', () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockReturnValue(JSON.stringify({ notes: { releaseNotes: { mode: 'versioned' } } }));
+
+    expect(() => loadConfig()).toThrow(/notes\.releaseNotes no longer supports mode/);
+  });
+
+  it('should throw a migration error when notes.releaseNotes.file is a string', () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockReturnValue(JSON.stringify({ notes: { releaseNotes: { file: 'RELEASE_NOTES.md' } } }));
+
+    expect(() => loadConfig()).toThrow(/file \(string\)/);
+  });
+
+  it('should accept the new notes.releaseNotes.file object shape', () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockReturnValue(
+      JSON.stringify({ notes: { releaseNotes: { file: { dir: 'release-notes' } } } }),
+    );
+
+    expect(() => loadConfig()).not.toThrow();
+  });
+
+  it('should throw a migration error for removed version fields', () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockReturnValue(JSON.stringify({ version: { versionStrategy: 'branchPattern' } }));
+
+    expect(() => loadConfig()).toThrow(/version no longer supports/);
+  });
+
+  it('should throw a migration error for removed ci fields', () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockReturnValue(JSON.stringify({ ci: { skipPatterns: ['chore: release '] } }));
+
+    expect(() => loadConfig()).toThrow(/ci no longer supports/);
+  });
+
+  it('should throw a migration error for the removed monorepo.mainPackage', () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockReturnValue(JSON.stringify({ monorepo: { mainPackage: 'core' } }));
+
+    expect(() => loadConfig()).toThrow(/monorepo\.mainPackage was removed/);
+  });
+
+  it('should throw a migration error for the removed monorepo.mode', () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockReturnValue(JSON.stringify({ monorepo: { mode: 'packages' } }));
+
+    expect(() => loadConfig()).toThrow(/monorepo\.mode was removed/);
   });
 
   it('should parse JSONC with comments', () => {
@@ -85,6 +136,31 @@ describe('loadConfig', () => {
 
     const result = loadConfig();
     expect(result.git?.remote).toBe('origin');
+  });
+
+  it('should discover releasekit.config.jsonc when no .json file exists', () => {
+    mockedFs.existsSync.mockImplementation((p) => String(p).endsWith('releasekit.config.jsonc'));
+    mockedFs.readFileSync.mockReturnValue(`{
+      // standing-pr config
+      "$schema": "https://goosewobbler.github.io/releasekit/schema.json",
+      "git": { "pushMethod": "ssh" }
+    }`);
+
+    const result = loadConfig();
+    expect(result.git?.pushMethod).toBe('ssh');
+    expect(mockedFs.existsSync).toHaveBeenCalledWith(expect.stringContaining('releasekit.config.jsonc'));
+  });
+
+  it('should prefer releasekit.config.json over .jsonc when both exist', () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockImplementation((p) =>
+      String(p).endsWith('releasekit.config.json')
+        ? JSON.stringify({ git: { remote: 'from-json' } })
+        : JSON.stringify({ git: { remote: 'from-jsonc' } }),
+    );
+
+    const result = loadConfig();
+    expect(result.git?.remote).toBe('from-json');
   });
 
   it('should substitute environment variables', () => {
@@ -187,6 +263,34 @@ describe('loadPublishConfig', () => {
     expect(result?.git?.remote).toBe('origin');
   });
 
+  it('should not let a publish.git block override an explicit top-level git.push: false', () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockReturnValue(
+      JSON.stringify({
+        git: { push: false },
+        publish: { git: { remote: 'upstream' } },
+      }),
+    );
+
+    // The publish.git block doesn't set push, so it must inherit the top-level git.push: false —
+    // not be silently flipped back to true by a default.
+    const result = loadPublishConfig();
+    expect(result?.git?.push).toBe(false);
+  });
+
+  it('should let publish.git.push explicitly override top-level git.push', () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockReturnValue(
+      JSON.stringify({
+        git: { push: false },
+        publish: { git: { push: true } },
+      }),
+    );
+
+    const result = loadPublishConfig();
+    expect(result?.git?.push).toBe(true);
+  });
+
   it('should inherit skipHooks from top-level git config', () => {
     mockedFs.existsSync.mockReturnValue(true);
     mockedFs.readFileSync.mockReturnValue(
@@ -275,20 +379,19 @@ describe('loadCIConfig', () => {
     vi.clearAllMocks();
   });
 
-  it('returns CI config from loaded config', () => {
+  it('should return CI config from loaded config', () => {
     mockedFs.existsSync.mockReturnValue(true);
     mockedFs.readFileSync.mockReturnValue(
       JSON.stringify({
-        ci: { prPreview: false, autoRelease: true },
+        ci: { prPreview: false },
       }),
     );
 
     const result = loadCIConfig();
-    expect(result?.prPreview).toBe(false);
-    expect(result?.autoRelease).toBe(true);
+    expect(result?.prPreview).toEqual({ enabled: false, refreshAfterRelease: false });
   });
 
-  it('returns undefined when no CI config', () => {
+  it('should return undefined when no CI config', () => {
     mockedFs.existsSync.mockReturnValue(true);
     mockedFs.readFileSync.mockReturnValue('{}');
 

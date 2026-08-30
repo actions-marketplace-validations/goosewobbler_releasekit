@@ -1,9 +1,26 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.4.10/schema.json",
-  "vcs": { "enabled": false, "clientKind": "git", "useIgnoreFile": false },
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": {
+    "enabled": false,
+    "clientKind": "git",
+    "useIgnoreFile": false
+  },
   "files": {
     "ignoreUnknown": false,
-    "includes": ["**", "!**/coverage", "!**/dist", "!**/out", "!.turbo", "!**/node_modules"]
+    "includes": [
+      "**",
+      "!**/coverage",
+      "!**/dist",
+      "!**/out",
+      "!.turbo",
+      "!**/node_modules",
+      // Agent worktrees are full checkouts carrying their own root biome.jsonc, and Biome refuses to
+      // run at all on a nested root config — in scope, one breaks `pnpm lint` for the whole repo.
+      "!**/.claude",
+      // Recorded eval fixtures — opaque provider-response blobs in the cache's native (compact) format.
+      // Formatting them would churn on every re-record and diverge from what the harness writes.
+      "!packages/notes/test/eval/fixtures/cache"
+    ]
   },
   "formatter": {
     "enabled": true,
@@ -20,8 +37,15 @@
   },
   "linter": {
     "enabled": true,
-    "includes": ["**"],
-    "rules": { "recommended": true, "style": { "useBlockStatements": "off" } }
+    "includes": [
+      "**"
+    ],
+    "rules": {
+      "recommended": true,
+      "style": {
+        "useBlockStatements": "off"
+      }
+    }
   },
   "javascript": {
     "formatter": {
@@ -36,12 +60,21 @@
       "bracketSpacing": true
     }
   },
+  "json": {
+    "formatter": {
+      "expand": "always"
+    }
+  },
   "overrides": [
     {
-      "includes": ["**/*.ts"],
+      "includes": [
+        "**/*.ts"
+      ],
       "linter": {
         "rules": {
-          "complexity": { "noUselessTypeConstraint": "error" },
+          "complexity": {
+            "noUselessTypeConstraint": "error"
+          },
           "correctness": {
             "noUndeclaredVariables": "off",
             "noUnusedVariables": "error"
@@ -61,17 +94,29 @@
       }
     },
     {
-      "includes": ["**/*.spec.ts", "**/mocks/*.ts"],
+      "includes": [
+        "**/*.spec.ts",
+        "**/mocks/*.ts"
+      ],
       "linter": {
         "rules": {
-          "complexity": { "useArrowFunction": "off" },
-          "suspicious": { "noExplicitAny": "off", "noTemplateCurlyInString": "off" }
+          "complexity": {
+            "useArrowFunction": "off"
+          },
+          "suspicious": {
+            "noExplicitAny": "off",
+            "noTemplateCurlyInString": "off"
+          }
         }
       }
     }
   ],
   "assist": {
     "enabled": true,
-    "actions": { "source": { "organizeImports": "on" } }
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
   }
 }

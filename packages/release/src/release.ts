@@ -1,12 +1,70 @@
-import { execSync } from 'node:child_process';
 import type { CIConfig, ReleaseConfig } from '@releasekit/config';
 import { loadConfig as loadReleaseKitConfig } from '@releasekit/config';
 import type { VersionOutput } from '@releasekit/core';
 import { error, info, setJsonMode, setLogLevel, setQuietMode, success, warn } from '@releasekit/core';
-import type { ReleaseType } from 'semver';
+import type { Forge } from '@releasekit/forge';
+import { PipelineError } from '@releasekit/publish';
+import { postFailureReport, resolveFailureReportIfPresent } from './failure-report/post.js';
+import { getGitHubContext, getHeadCommitMessage, matchesSkipPattern } from './git.js';
+import { fetchPRLabels, findMergedPRsForCommit, forgeFor } from './github.js';
 import { DEFAULT_LABELS, detectLabelConflicts } from './label-utils.js';
-import { createOctokit, fetchPRLabels, findMergedPRsForCommit } from './preview-github.js';
+import { refreshFeederPreviews } from './preview/refresh.js';
+import { mergeNotesRegions } from './standing-pr/notes-region.js';
+import { runNotesStep, runPublishStep, runVersionStep } from './steps.js';
 import type { ReleaseOptions, ReleaseOutput } from './types.js';
+import { publishableUpdates } from './version-display.js';
+
+/**
+ * Resolve the release-driving PR + mode for the failure report. Direct/label mode: the merged
+ * feature PR that triggered the release (discovered from the HEAD commit). Manual dispatch (no
+ * PR): mode 'manual' with no PR number — the report goes to the workflow step summary.
+ */
+async function resolveReleaseReportTarget(): Promise<{
+  forge: Forge;
+  prNumber?: number;
+  mode: 'direct' | 'manual';
+} | null> {
+  const githubContext = getGitHubContext();
+  if (!githubContext?.token) return null;
+  const forge = forgeFor({ token: githubContext.token, owner: githubContext.owner, repo: githubContext.repo });
+  const { sha } = githubContext;
+
+  const isManualDispatch = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch';
+  let prNumber: number | undefined;
+  if (sha && !isManualDispatch) {
+    const prs = await findMergedPRsForCommit(forge, sha);
+    prNumber = prs[0];
+  }
+
+  return { forge, prNumber, mode: prNumber !== undefined ? 'direct' : 'manual' };
+}
+
+/**
+ * Post a partial-publish failure report for a direct/label-mode or manual-dispatch release.
+ * Best-effort: never throws (the caller re-throws the original pipeline error).
+ */
+async function reportReleaseFailure(versionOutput: VersionOutput, err: PipelineError): Promise<void> {
+  try {
+    const target = await resolveReleaseReportTarget();
+    if (!target) {
+      warn('No GitHub context — publish-failure report not surfaced');
+      return;
+    }
+    await postFailureReport(
+      {
+        forge: target.forge,
+        mode: target.mode,
+        prNumber: target.prNumber,
+      },
+      versionOutput,
+      err,
+    );
+  } catch (reportErr) {
+    warn(
+      `Failed to surface publish-failure report: ${reportErr instanceof Error ? reportErr.message : String(reportErr)}`,
+    );
+  }
+}
 
 export function resolveScopeToTarget(scopeName: string, scopeLabels: Record<string, string>): string {
   const prefixed = `scope:${scopeName}`;
@@ -14,30 +72,6 @@ export function resolveScopeToTarget(scopeName: string, scopeLabels: Record<stri
   if (scopeLabels[scopeName]) return scopeLabels[scopeName];
   const available = Object.keys(scopeLabels).join(', ');
   throw new Error(`Scope "${scopeName}" not found in ci.scopeLabels. Available: ${available}`);
-}
-
-export function getHeadCommitMessage(cwd?: string): string | null {
-  try {
-    return execSync('git log -1 --pretty=%s', { encoding: 'utf-8', cwd }).trim();
-  } catch {
-    return null;
-  }
-}
-
-export function getGitHubContext(): { owner: string; repo: string; sha: string } | null {
-  const repo = process.env.GITHUB_REPOSITORY;
-  const sha = process.env.GITHUB_SHA;
-
-  if (!repo || !sha) {
-    return null;
-  }
-
-  const [owner, repoName] = repo.split('/');
-  if (!owner || !repoName) {
-    return null;
-  }
-
-  return { owner, repo: repoName, sha };
 }
 
 interface PRLabelsResult {
@@ -53,27 +87,33 @@ async function applyScopeLabelsFromPR(
   options: ReleaseOptions,
 ): Promise<PRLabelsResult> {
   const scopeLabels = ciConfig?.scopeLabels ?? {};
-  const defaultScope = ciConfig?.defaultScope;
 
   const githubContext = getGitHubContext();
-  if (!githubContext) {
+  if (!githubContext?.sha) {
     return { target: options.target, scopeLabels: [], labels: [] };
   }
 
-  const token = process.env.GITHUB_TOKEN;
+  const token = githubContext.token;
   if (!token) {
     warn('No GITHUB_TOKEN available — skipping scope label detection');
     return { target: options.target, scopeLabels: [], labels: [] };
   }
 
-  const octokit = createOctokit(token);
+  // Skip scope label check for manual workflow_dispatch events
+  const githubEventName = process.env.GITHUB_EVENT_NAME;
+  if (githubEventName === 'workflow_dispatch') {
+    info('Manual workflow_dispatch release — skipping scope label check');
+    return { target: options.target, scopeLabels: [], labels: [] };
+  }
 
-  const prNumbers = await findMergedPRsForCommit(octokit, githubContext.owner, githubContext.repo, githubContext.sha);
+  const forge = forgeFor({ token, owner: githubContext.owner, repo: githubContext.repo });
+
+  const prNumbers = await findMergedPRsForCommit(forge, githubContext.sha);
   const allLabels: string[] = [];
   const perPRLabels: Map<number, string[]> = new Map();
 
   for (const prNumber of prNumbers) {
-    const labels = await fetchPRLabels(octokit, githubContext.owner, githubContext.repo, prNumber);
+    const labels = await fetchPRLabels(forge, prNumber);
     allLabels.push(...labels);
     perPRLabels.set(prNumber, labels);
   }
@@ -96,7 +136,7 @@ async function applyScopeLabelsFromPR(
     }
 
     if (conflict.prereleaseConflict) {
-      warn(`PR #${prNumber} has conflicting labels "${labels.stable}" and "${labels.prerelease}" — release blocked`);
+      warn(`PR #${prNumber} has conflicting labels "${labels.graduate}" and "${labels.prerelease}" — release blocked`);
       return { target: options.target, scopeLabels: [], labels: [], blocked: true };
     }
     if (conflict.bumpConflict && (ciConfig?.releaseTrigger ?? 'label') === 'label') {
@@ -106,14 +146,8 @@ async function applyScopeLabelsFromPR(
   }
 
   if (prNumbers.length === 0) {
-    if (defaultScope && Object.keys(scopeLabels).length > 0) {
-      const defaultPattern = scopeLabels[defaultScope];
-      if (defaultPattern) {
-        info(`No merged PRs found — using default scope "${defaultScope}" (${defaultPattern})`);
-        return { target: defaultPattern, scopeLabels: [], labels: allLabels };
-      }
-    }
-    info('No merged PRs found for HEAD commit — releasing all packages');
+    // Manual release (no PR context) - allow releasing all packages if no target specified
+    info(`No merged PRs found — ${options.target ? `using target: ${options.target}` : 'releasing all packages'}`);
     return { target: options.target, scopeLabels: [], labels: allLabels };
   }
 
@@ -128,12 +162,13 @@ async function applyScopeLabelsFromPR(
   let finalTarget = options.target;
   if (matchedScopePatterns.length > 0) {
     finalTarget = matchedScopePatterns.join(', ');
-  } else if (defaultScope && Object.keys(scopeLabels).length > 0) {
-    const defaultPattern = scopeLabels[defaultScope];
-    if (defaultPattern) {
-      info(`No scope label found — using default scope "${defaultScope}" (${defaultPattern})`);
-      finalTarget = defaultPattern;
-    }
+  } else if (!options.target) {
+    const scopeLabelsConfigured = Object.keys(scopeLabels).length > 0;
+    throw new Error(
+      scopeLabelsConfigured
+        ? 'No scope specified. Use --target flag to specify packages, or include a scope label in a merged PR.'
+        : 'No scope specified. Use --target flag to specify which packages to release.',
+    );
   }
 
   return { target: finalTarget, scopeLabels: matchedScopePatterns, labels: allLabels };
@@ -193,7 +228,7 @@ export async function runRelease(inputOptions: ReleaseOptions): Promise<ReleaseO
 
   // Only apply scope labels in non-dry-run (release) mode
   // In dry-run/preview mode, preview.ts already handles scope labels via applyLabelOverrides
-  // However, we still call applyScopeLabelsFromPR to detect label conflicts (e.g., release:stable + release:prerelease)
+  // However, we still call applyScopeLabelsFromPR to detect label conflicts (e.g., release:graduate + channel:prerelease)
   const scopeResult = await applyScopeLabelsFromPR(ciConfig, options);
   if (scopeResult.blocked) {
     info('Release blocked due to conflicting PR labels');
@@ -212,11 +247,9 @@ export async function runRelease(inputOptions: ReleaseOptions): Promise<ReleaseO
 
   // Apply skipPatterns: exit early if HEAD commit matches a skip pattern
   if (releaseConfig?.ci?.skipPatterns?.length) {
-    const headCommit = getHeadCommitMessage(options.projectDir);
+    const headCommit = await getHeadCommitMessage(options.projectDir);
     if (headCommit) {
-      const matchedPattern = releaseConfig.ci.skipPatterns.find(
-        (p) => headCommit.startsWith(p) || headCommit.includes(p),
-      );
+      const matchedPattern = matchesSkipPattern(headCommit, releaseConfig.ci.skipPatterns);
       if (matchedPattern) {
         info(`Skipping release: commit message matches skip pattern "${matchedPattern}"`);
         return null;
@@ -242,11 +275,11 @@ export async function runRelease(inputOptions: ReleaseOptions): Promise<ReleaseO
     return null;
   }
 
-  // Apply minChanges threshold before modifying any files
-  if (releaseConfig?.ci?.minChanges !== undefined && versionOutput.updates.length < releaseConfig.ci.minChanges) {
-    info(
-      `Skipping release: ${versionOutput.updates.length} package(s) to update, minimum is ${releaseConfig.ci.minChanges}`,
-    );
+  // Apply minChanges threshold before modifying any files. Counts publishable packages only —
+  // the root lockstep bump (sync mode) would otherwise inflate the count by one.
+  const publishableCount = publishableUpdates(versionOutput).length;
+  if (releaseConfig?.ci?.minChanges !== undefined && publishableCount < releaseConfig.ci.minChanges) {
+    info(`Skipping release: ${publishableCount} package(s) to update, minimum is ${releaseConfig.ci.minChanges}`);
     return null;
   }
 
@@ -259,7 +292,10 @@ export async function runRelease(inputOptions: ReleaseOptions): Promise<ReleaseO
 
   info(`Found ${versionOutput.updates.length} package update(s)`);
   for (const update of versionOutput.updates) {
-    info(`  ${update.packageName} → ${update.newVersion}`);
+    // Annotate the resolved version action when present. Absent on manifests produced
+    // before the field existed — render nothing rather than an empty parenthetical.
+    const annotation = update.action ? ` (${update.action})` : '';
+    info(`  ${update.packageName} → ${update.newVersion}${annotation}`);
   }
 
   // --- Step 2: Notes ---
@@ -277,103 +313,51 @@ export async function runRelease(inputOptions: ReleaseOptions): Promise<ReleaseO
     success('Release notes generated');
   }
 
+  // Human-edited notes win per package (manual-mode draft dispatch). Merged here so the
+  // edits flow into both the publish step's release-body map and the returned releaseNotes.
+  if (options.editedNotes && Object.keys(options.editedNotes).length > 0) {
+    releaseNotes = mergeNotesRegions(releaseNotes ?? {}, options.editedNotes);
+    info(`Using human-edited release notes for ${Object.keys(options.editedNotes).length} package(s) from the draft.`);
+  }
+
   // --- Step 3: Publish ---
   // The publish step's git-commit stage commits version bumps + changelogs + tags.
   let publishOutput: ReleaseOutput['publishOutput'];
   if (!options.skipPublish) {
     info('Publishing...');
-    publishOutput = await runPublishStep(versionOutput, options, releaseNotes, notesFiles);
+    try {
+      publishOutput = await runPublishStep(versionOutput, options, releaseNotes, notesFiles);
+    } catch (err) {
+      // On a partial-publish failure the pipeline throws a PipelineError carrying the per-package
+      // ledger. Surface a failure report on the release-driving PR (or the step summary), then
+      // re-throw so the workflow still fails. Skip in dry-run — no real publish happened.
+      if (err instanceof PipelineError && !options.dryRun) {
+        await reportReleaseFailure(versionOutput, err);
+      }
+      throw err;
+    }
     success('Publish complete');
+
+    // A successful publish clears any prior failure report for this release (resolves it and the
+    // supersede warning). Only meaningful for a direct-mode release with a triggering PR.
+    if (!options.dryRun) {
+      try {
+        const target = await resolveReleaseReportTarget();
+        if (target?.prNumber !== undefined) {
+          await resolveFailureReportIfPresent(target.forge, target.prNumber, versionOutput);
+        }
+      } catch (resolveErr) {
+        warn(
+          `Failed to resolve prior publish-failure report: ${resolveErr instanceof Error ? resolveErr.message : String(resolveErr)}`,
+        );
+      }
+
+      // The release moved `main`: refresh still-open feeder PRs' "what would release" preview in
+      // process (opt-in via ci.prPreview.refreshAfterRelease) so they aren't left stale against the
+      // new baseline. Best-effort and never throws — must not fail an already-successful release.
+      await refreshFeederPreviews({ config: options.config, projectDir: options.projectDir });
+    }
   }
 
   return { versionOutput, notesGenerated, packageNotes, releaseNotes, publishOutput };
-}
-
-async function runVersionStep(options: ReleaseOptions): Promise<VersionOutput> {
-  const { loadConfig, VersionEngine, enableJsonOutput, getJsonData } = await import('@releasekit/version');
-
-  enableJsonOutput(options.dryRun);
-
-  const config = loadConfig({ cwd: options.projectDir, configPath: options.config });
-
-  const targets: string[] = options.target ? options.target.split(',').map((t) => t.trim()) : [];
-
-  const runOptions = {
-    bump: options.bump as ReleaseType | undefined,
-    prerelease: options.prerelease,
-    stable: options.stable,
-    dryRun: options.dryRun,
-    sync: options.sync,
-    targets,
-  };
-
-  const engine = new VersionEngine(config, runOptions);
-  const pkgsResult = await engine.getWorkspacePackages();
-  const resolvedCount = pkgsResult.packages.length;
-
-  if (resolvedCount === 0) {
-    throw new Error('No packages found in workspace');
-  }
-
-  const effectiveSync = options.sync || config.sync;
-  if (effectiveSync) {
-    engine.setStrategy('sync');
-    await engine.run(pkgsResult);
-  } else if (resolvedCount === 1) {
-    engine.setStrategy('single');
-    await engine.run(pkgsResult);
-  } else {
-    engine.setStrategy('async');
-    await engine.run(pkgsResult, targets);
-  }
-
-  return getJsonData() as VersionOutput;
-}
-
-interface NotesStepResult {
-  packageNotes: Record<string, string>;
-  releaseNotes?: Record<string, string>;
-  files: string[];
-}
-
-async function runNotesStep(versionOutput: VersionOutput, options: ReleaseOptions): Promise<NotesStepResult> {
-  const { versionOutputToChangelogInput, runPipeline, loadConfig } = await import('@releasekit/notes');
-
-  const config = loadConfig(options.projectDir, options.config);
-
-  const input = versionOutputToChangelogInput(versionOutput);
-  const result = await runPipeline(input, config, options.dryRun);
-
-  return { packageNotes: result.packageNotes, releaseNotes: result.releaseNotes, files: result.files };
-}
-
-async function runPublishStep(
-  versionOutput: VersionOutput,
-  options: ReleaseOptions,
-  releaseNotes?: Record<string, string>,
-  additionalFiles?: string[],
-) {
-  const { runPipeline, loadConfig } = await import('@releasekit/publish');
-
-  const config = loadConfig({ configPath: options.config });
-
-  if (options.branch) {
-    config.git.branch = options.branch;
-  }
-
-  const publishOptions = {
-    dryRun: options.dryRun,
-    registry: 'all' as const,
-    npmAuth: options.npmAuth ?? 'auto',
-    skipGit: options.skipGit,
-    skipPublish: false,
-    skipGithubRelease: options.skipGithubRelease,
-    skipVerification: options.skipVerification,
-    json: options.json,
-    verbose: options.verbose,
-    releaseNotes,
-    additionalFiles,
-  };
-
-  return runPipeline(versionOutput, config, publishOptions);
 }

@@ -1,5 +1,8 @@
 # @releasekit/publish
 
+> [!WARNING]
+> 🚧 **Pre-1.0.0** — ReleaseKit is evolving fast and **💥 breaking changes are common**; it's **not production-ready** until `v1.0.0`. Pin exact versions. See the [main README](../../README.md) for details.
+
 [![@releasekit/publish](https://img.shields.io/badge/@releasekit-publish-9feaf9?labelColor=1a1a1a&style=plastic)](https://www.npmjs.com/package/@releasekit/publish)
 [![Version](https://img.shields.io/npm/v/@releasekit/publish?color=28a745&labelColor=1a1a1a)](https://www.npmjs.com/package/@releasekit/publish)
 [![Downloads](https://img.shields.io/npm/dw/@releasekit/publish?color=6f42c1&labelColor=1a1a1a)](https://www.npmjs.com/package/@releasekit/publish)
@@ -19,9 +22,15 @@
 
 ## Installation
 
+**npm:**
+
 ```bash
 npm install -g @releasekit/publish
-# or
+```
+
+**pnpm:**
+
+```bash
 pnpm add -g @releasekit/publish
 ```
 
@@ -55,6 +64,10 @@ The publish pipeline runs in order:
 9. **GitHub Release** - Create GitHub releases
 
 The pipeline is **fail-fast**: the first package publish failure throws immediately. Git push and GitHub release are skipped, so the version commit and tag remain local until the issue is fixed and the release is retried.
+
+### Auto-retry for transient registry errors
+
+Before failing the stage, the npm and cargo publish steps automatically retry **transient** registry errors — HTTP 5xx, timeouts (`ETIMEDOUT`), connection resets (`ECONNRESET`), DNS hiccups (`EAI_AGAIN`), and rate limits (`429`). Each package is retried up to **2 times** (3 attempts total) with exponential backoff. **Permanent** errors — authentication failures, missing scope/package, and validation errors — fail fast with no retries. The attempt count is recorded in the per-package publish result. Re-running a publish that partially landed is safe: the already-published pre-check (and the conflict detection on the publish error itself) resolves it as a skip rather than a duplicate publish, including on a retry attempt.
 
 ## CLI Reference
 

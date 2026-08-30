@@ -6,22 +6,24 @@
   },
   "version": {
     "preset": "angular",
-    "sync": false,
+    "sync": true,
     "versionPrefix": "v",
-    "packages": ["packages/version", "packages/notes", "packages/publish", "packages/release"],
+    "packages": [
+      "packages/version",
+      "packages/notes",
+      "packages/publish",
+      "packages/release"
+    ],
     "mismatchStrategy": "prefer-package",
-    "tagTemplate": "${packageName}-${prefix}${version}",
-    "commitMessage": "chore: release ${packageName}@${version} [skip ci]",
+    "commitMessage": "chore: release v${version} [skip ci]",
     "prereleaseIdentifier": "next",
-    "packageSpecificTags": true
+    "baselineTagTemplate": "release/${prefix}${version}"
   },
   "notes": {
     "changelog": {
       "mode": "packages"
     },
     "releaseNotes": {
-      "mode": "root",
-      "file": "RELEASE_NOTES.md",
       "templates": {
         "path": "./templates/release-notes/release.liquid",
         "engine": "liquid"
@@ -35,11 +37,26 @@
           "categorize": true
         },
         "categories": [
-          { "name": "New", "description": "New features and additions" },
-          { "name": "Fixed", "description": "Bug fixes including security and performance fixes" },
-          { "name": "Changed", "description": "Changes to existing functionality" },
-          { "name": "Removed", "description": "Features that were removed" },
-          { "name": "Documentation", "description": "Documentation updates" },
+          {
+            "name": "New",
+            "description": "New features and additions"
+          },
+          {
+            "name": "Fixed",
+            "description": "Bug fixes including security and performance fixes"
+          },
+          {
+            "name": "Changed",
+            "description": "Changes to existing functionality"
+          },
+          {
+            "name": "Removed",
+            "description": "Features that were removed"
+          },
+          {
+            "name": "Documentation",
+            "description": "Documentation updates"
+          },
           {
             "name": "Developer",
             "description": "Internal changes",
@@ -74,7 +91,20 @@
   },
   "release": {
     "ci": {
-      "skipPatterns": ["chore: release "]
+      "skipPatterns": [
+        "chore: release "
+      ]
+    }
+  },
+  "ci": {
+    "releaseStrategy": "standing-pr",
+    "releaseTrigger": "label",
+    "scopeLabels": {
+      "scope:all": "@releasekit/*"
+    },
+    "standingPr": {
+      "branch": "release/next",
+      "mergeMethod": "squash"
     }
   }
 }

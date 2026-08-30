@@ -1,9 +1,12 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { debug, info, success, warn } from '@releasekit/core';
+import { type ChangelogRefsMode, debug, info, parseGitHubOwnerRepo, success, warn } from '@releasekit/core';
 import { parseVersionOutput } from '../input/version-output.js';
+import { withContentHashCache } from '../llm/cache.js';
+import { fetchPullRequestContext, parseIssueNumbers, resolveGitHubToken } from '../llm/context/prFetcher.js';
 import { LLM_DEFAULTS } from '../llm/defaults.js';
-import type { LLMProvider } from '../llm/index.js';
+import { fetchExamples } from '../llm/examples/fetcher.js';
+import type { Example, LLMProvider } from '../llm/index.js';
 import {
   categorizeEntries,
   createProvider,
@@ -12,8 +15,11 @@ import {
   generateReleaseNotes,
   summarizeEntries,
 } from '../llm/index.js';
+import { isRetryableLLMError } from '../llm/retryable.js';
 import { type FormatVersionOptions, formatVersion, writeMarkdown } from '../output/markdown.js';
+import { writeVersionedNotes } from '../output/versioned.js';
 import { renderTemplate } from '../templates/index.js';
+import { mapWithConcurrency } from '../utils/concurrency.js';
 import { withRetry } from '../utils/retry.js';
 import type {
   ChangelogInput,
@@ -24,6 +30,7 @@ import type {
   LLMCategory,
   LLMConfig,
   PackageChangelog,
+  PRContext,
   TemplateContext,
   TemplateEngine,
 } from './types.js';
@@ -51,6 +58,17 @@ function findCompoundTagSepPos(tag: string): number {
   return -1;
 }
 
+/** True when position `i` in `tag` begins a semver version: a digit, or a `v` immediately followed by a digit. */
+function isVersionStartAt(tag: string, i: number): boolean {
+  const c = tag.charCodeAt(i);
+  if (c >= 48 && c <= 57) return true;
+  if (tag[i] === 'v') {
+    const n = tag.charCodeAt(i + 1);
+    return n >= 48 && n <= 57;
+  }
+  return false;
+}
+
 function generateCompareUrl(repoUrl: string, from: string, to: string, packageName?: string): string {
   // Check if using package-specific tags (from version contains @ and package name)
   const isPackageSpecific = from.includes('@') && packageName && from.includes(packageName);
@@ -69,8 +87,16 @@ function generateCompareUrl(repoUrl: string, from: string, to: string, packageNa
     // Use index-based string operations instead of regex to avoid ReDoS on inputs with
     // many repeated digits (polynomial backtracking with lazy + greedy quantifiers).
     const toClean = to.replace(/^v/, '');
+    const atPos = from.lastIndexOf('@');
     const dashVPos = from.lastIndexOf('-v');
-    if (dashVPos > 0 && from.charCodeAt(dashVPos + 2) >= 48 && from.charCodeAt(dashVPos + 2) <= 57) {
+    if (atPos > 0 && isVersionStartAt(from, atPos + 1)) {
+      // Sanitized package-specific tag: "<de-scoped-name>@[v]<version>" (e.g. "scope-pkg@v1.2.3").
+      // formatTag always strips the "@scope/", so the raw package name never appears literally and
+      // the isPackageSpecific check above can't match it. Keep the "<name>@" prefix and re-attach the
+      // new version, preserving a "v" only if the original tag had one.
+      fromVersion = from;
+      toVersion = `${from.slice(0, atPos + 1)}${from[atPos + 1] === 'v' ? 'v' : ''}${toClean}`;
+    } else if (dashVPos > 0 && from.charCodeAt(dashVPos + 2) >= 48 && from.charCodeAt(dashVPos + 2) <= 57) {
       // "-v" followed by a digit → compound tag with explicit "v" prefix
       fromVersion = from;
       toVersion = `${from.slice(0, dashVPos + 1)}v${toClean}`;
@@ -128,6 +154,7 @@ export function createTemplateContext(pkg: PackageChangelog): TemplateContext {
     repoUrl: pkg.repoUrl,
     entries: pkg.entries,
     compareUrl,
+    isFirstRelease: pkg.previousVersion === null,
   };
 }
 
@@ -149,7 +176,12 @@ export function createDocumentContext(contexts: TemplateContext[], repoUrl?: str
   };
 }
 
-async function processWithLLM(context: TemplateContext, llmConfig: LLMConfig): Promise<TemplateContext> {
+async function processWithLLM(
+  context: TemplateContext,
+  llmConfig: LLMConfig,
+  examples: Example[],
+  packageNames: string[],
+): Promise<TemplateContext> {
   const tasks = llmConfig.tasks ?? {};
   const llmContext = {
     packageName: context.packageName,
@@ -160,12 +192,15 @@ async function processWithLLM(context: TemplateContext, llmConfig: LLMConfig): P
     style: llmConfig.style,
     scopes: llmConfig.scopes,
     prompts: llmConfig.prompts,
+    examples,
+    packageNames,
   };
 
   const enhanced: EnhancedData = {
     entries: context.entries,
   };
 
+  let provider: LLMProvider;
   try {
     info(`Using LLM provider: ${llmConfig.provider}${llmConfig.model ? ` (${llmConfig.model})` : ''}`);
     if (llmConfig.baseURL) {
@@ -173,41 +208,75 @@ async function processWithLLM(context: TemplateContext, llmConfig: LLMConfig): P
     }
 
     const rawProvider = createProvider(llmConfig);
+    // Opt-in on-disk cache (innermost, so a hit skips both the provider call and the retry wrapper).
+    const baseProvider = llmConfig.cache
+      ? withContentHashCache(rawProvider, { model: llmConfig.model, baseURL: llmConfig.baseURL })
+      : rawProvider;
     const retryOpts = llmConfig.retry ?? LLM_DEFAULTS.retry;
     const configOptions = llmConfig.options;
-    const provider: LLMProvider = {
-      name: rawProvider.name,
-      complete: (prompt, opts) =>
-        withRetry(() => rawProvider.complete(prompt, { ...configOptions, ...opts }), retryOpts),
+    provider = {
+      name: baseProvider.name,
+      capabilities: baseProvider.capabilities,
+      // Fail fast on non-transient errors (4xx auth/validation); only retry timeout/429/5xx/network.
+      complete: (messages, opts) =>
+        withRetry(() => baseProvider.complete(messages, { ...configOptions, ...opts }), {
+          ...retryOpts,
+          shouldRetry: isRetryableLLMError,
+        }),
     };
 
     const activeTasks = Object.entries(tasks)
       .filter(([, enabled]) => enabled)
       .map(([name]) => name);
     info(`Running LLM tasks: ${activeTasks.join(', ')}`);
+  } catch (error) {
+    // Provider setup failed — nothing computed yet, so fall back to the raw context.
+    warn(`LLM setup failed: ${error instanceof Error ? error.message : String(error)}`);
+    warn('Falling back to non-LLM changelog rendering. Check your LLM config or set RELEASEKIT_DEBUG=1 for details.');
+    return context;
+  }
 
-    if (tasks.enhance && tasks.categorize) {
+  // Each task soft-fails independently: a late summarize/releaseNotes failure must not discard the
+  // (already paid-for) enhancement and categorization computed earlier in the same run.
+  const taskFailed = (task: string, error: unknown): void => {
+    warn(`LLM ${task} failed: ${error instanceof Error ? error.message : String(error)}. Keeping results so far.`);
+  };
+
+  if (tasks.enhance && tasks.categorize) {
+    try {
       info('Enhancing and categorizing entries with LLM...');
       const result = await enhanceAndCategorize(provider, context.entries, llmContext);
       enhanced.entries = result.enhancedEntries;
       enhanced.categories = buildOrderedCategories(result.categories, llmContext.categories);
       info(`Enhanced ${enhanced.entries.length} entries into ${result.categories.length} categories`);
-    } else {
-      if (tasks.enhance) {
+    } catch (error) {
+      taskFailed('enhance+categorize', error);
+    }
+  } else {
+    if (tasks.enhance) {
+      try {
         info('Enhancing entries with LLM...');
         enhanced.entries = await enhanceEntries(provider, context.entries, llmContext, llmConfig.concurrency);
         info(`Enhanced ${enhanced.entries.length} entries`);
+      } catch (error) {
+        taskFailed('enhance', error);
       }
+    }
 
-      if (tasks.categorize) {
+    if (tasks.categorize) {
+      try {
         info('Categorizing entries with LLM...');
         const categorized = await categorizeEntries(provider, enhanced.entries, llmContext);
         enhanced.categories = buildOrderedCategories(categorized, llmContext.categories);
         info(`Created ${categorized.length} categories`);
+      } catch (error) {
+        taskFailed('categorize', error);
       }
     }
+  }
 
-    if (tasks.summarize) {
+  if (tasks.summarize) {
+    try {
       info('Summarizing entries with LLM...');
       enhanced.summary = await summarizeEntries(provider, enhanced.entries, llmContext);
       if (enhanced.summary) {
@@ -216,9 +285,13 @@ async function processWithLLM(context: TemplateContext, llmConfig: LLMConfig): P
       } else {
         warn('Summary generation returned empty result');
       }
+    } catch (error) {
+      taskFailed('summarize', error);
     }
+  }
 
-    if (tasks.releaseNotes) {
+  if (tasks.releaseNotes) {
+    try {
       info('Generating release notes with LLM...');
       enhanced.releaseNotes = await generateReleaseNotes(provider, enhanced.entries, llmContext);
       if (enhanced.releaseNotes) {
@@ -226,17 +299,15 @@ async function processWithLLM(context: TemplateContext, llmConfig: LLMConfig): P
       } else {
         warn('Release notes generation returned empty result');
       }
+    } catch (error) {
+      taskFailed('releaseNotes', error);
     }
-
-    return {
-      ...context,
-      enhanced,
-    };
-  } catch (error) {
-    warn(`LLM processing failed: ${error instanceof Error ? error.message : String(error)}`);
-    warn('Falling back to raw entries');
-    return context;
   }
+
+  return {
+    ...context,
+    enhanced,
+  };
 }
 
 function getBuiltinTemplatePath(style: string): string {
@@ -302,7 +373,28 @@ export interface PipelineResult {
   releaseNotes?: Record<string, string>;
 }
 
-export async function runPipeline(input: ChangelogInput, config: Config, dryRun: boolean): Promise<PipelineResult> {
+export interface PipelineOptions {
+  /**
+   * Skip the LLM pass and the release-notes file write (RELEASE_NOTES.md).
+   * Per-package CHANGELOG.md is unaffected. Use during standing-PR update so the
+   * standing-PR workflow doesn't depend on LLM availability and doesn't pay for
+   * an LLM call on every push to main.
+   */
+  skipReleaseNotes?: boolean;
+  /**
+   * Skip the changelog file writes (CHANGELOG.md). LLM + release-notes generation
+   * are unaffected. Use during publish from manifest to regenerate only the
+   * release notes against an already-bumped tree.
+   */
+  skipChangelogs?: boolean;
+}
+
+export async function runPipeline(
+  input: ChangelogInput,
+  config: Config,
+  dryRun: boolean,
+  pipelineOptions?: PipelineOptions,
+): Promise<PipelineResult> {
   debug(`Processing ${input.packages.length} package(s)`);
 
   let contexts = input.packages.map(createTemplateContext);
@@ -311,28 +403,93 @@ export async function runPipeline(input: ChangelogInput, config: Config, dryRun:
   // mode defaults to 'root' for any object config that omits it (e.g. { file: 'CHANGES.md' }).
   const changelogConfig = config.changelog === false ? false : { mode: 'root' as const, ...(config.changelog ?? {}) };
   // releaseNotes: undefined = off (default), false = explicitly disabled, object = configured.
-  // mode defaults to 'root' only when file output is explicitly intended (mode or file is set).
-  // Omitting both lets LLM run without writing any file, as documented in the schema.
+  // Notes always flow to the GitHub release body; in-repo file output is opt-in via `file.dir`.
   const releaseNotesConfig =
-    config.releaseNotes === false || config.releaseNotes === undefined
-      ? undefined
-      : config.releaseNotes.mode !== undefined || config.releaseNotes.file !== undefined
-        ? { mode: 'root' as const, ...config.releaseNotes }
-        : config.releaseNotes;
+    config.releaseNotes === false || config.releaseNotes === undefined ? undefined : config.releaseNotes;
 
   const llmConfig = releaseNotesConfig?.llm;
-  if (llmConfig && !process.env.CHANGELOG_NO_LLM) {
+  // The LLM pass is part of release-notes generation: enhanced text only flows into the
+  // release-notes output (and the per-package map returned to callers). When release notes
+  // are skipped, the LLM call is wasted compute, so gate them together.
+  if (llmConfig && !process.env.CHANGELOG_NO_LLM && !pipelineOptions?.skipReleaseNotes) {
     info('Processing with LLM enhancement');
-    contexts = await Promise.all(contexts.map((ctx) => processWithLLM(ctx, llmConfig)));
+
+    const examplesCount = llmConfig.examples ?? 3;
+    const repoUrl = contexts[0]?.repoUrl ?? input.metadata?.repoUrl;
+    const ownerRepo = repoUrl ? parseGitHubOwnerRepo(repoUrl) : null;
+    const examplesByPackage = new Map<string, Example[]>();
+
+    if (examplesCount > 0 && ownerRepo) {
+      await Promise.all(
+        contexts.map(async (ctx) => {
+          const examples = await fetchExamples({
+            owner: ownerRepo.owner,
+            repo: ownerRepo.repo,
+            packageName: ctx.packageName,
+            count: examplesCount,
+            isMonorepo: contexts.length > 1,
+          });
+          examplesByPackage.set(ctx.packageName, examples);
+          if (examples.length > 0) {
+            debug(`Loaded ${examples.length} example(s) for ${ctx.packageName}`);
+          }
+        }),
+      );
+    }
+
+    // Fetch PR context for all entries across all packages
+    const prCache = new Map<number, PRContext | null>();
+    const pullRequestsEnabled = llmConfig.context?.pullRequests !== false;
+    if (pullRequestsEnabled && ownerRepo) {
+      const allIssueNumbers = [
+        ...new Set(contexts.flatMap((ctx) => ctx.entries.flatMap((e) => parseIssueNumbers(e.issueIds ?? [])))),
+      ];
+
+      if (allIssueNumbers.length > 0) {
+        const token = resolveGitHubToken();
+        if (!token) {
+          warn('No GitHub token available — skipping PR context fetch (set GITHUB_TOKEN to enable)');
+        } else {
+          debug(`Fetching PR context for ${allIssueNumbers.length} issue(s)`);
+          await fetchPullRequestContext(ownerRepo.owner, ownerRepo.repo, allIssueNumbers, token, prCache);
+          debug(`Loaded PR context for ${prCache.size} issue(s)`);
+        }
+      }
+    }
+
+    // Decorate entries with fetched PR context
+    if (prCache.size > 0) {
+      contexts = contexts.map((ctx) => ({
+        ...ctx,
+        entries: ctx.entries.map((entry) => {
+          const prs = parseIssueNumbers(entry.issueIds ?? [])
+            .map((n) => prCache.get(n))
+            .filter((pr): pr is PRContext => pr != null);
+          return prs.length > 0 ? { ...entry, context: { prs } } : entry;
+        }),
+      }));
+    }
+
+    const allPackageNames = contexts.map((c) => c.packageName);
+    // Bound cross-package fan-out with the same `concurrency` knob used within a package, so a large
+    // monorepo doesn't open one in-flight LLM request per package all at once and trip rate limits.
+    const concurrency = llmConfig.concurrency ?? LLM_DEFAULTS.concurrency;
+    contexts = await mapWithConcurrency(contexts, concurrency, (ctx) =>
+      processWithLLM(ctx, llmConfig, examplesByPackage.get(ctx.packageName) ?? [], allPackageNames),
+    );
   }
 
   const files: string[] = [];
 
   const fmtOpts: FormatVersionOptions = {
     includePackageName: contexts.length > 1 || contexts.some((c) => c.packageName.includes('/')),
+    categoryOrder: llmConfig?.categoryOrder,
+    links: releaseNotesConfig?.links,
+    firstRelease: releaseNotesConfig?.firstRelease,
+    refs: (changelogConfig !== false ? changelogConfig.refs : undefined) ?? 'link',
   };
 
-  if (changelogConfig !== false && changelogConfig.mode) {
+  if (!pipelineOptions?.skipChangelogs && changelogConfig !== false && changelogConfig.mode) {
     const fileName = changelogConfig.file ?? 'CHANGELOG.md';
     const mode = changelogConfig.mode;
 
@@ -355,7 +512,13 @@ export async function runPipeline(input: ChangelogInput, config: Config, dryRun:
       }
 
       if (mode === 'packages' || mode === 'both') {
-        const monoFiles = await writeMonorepoFiles(contexts, config, dryRun, changelogConfig.file ?? 'CHANGELOG.md');
+        const monoFiles = await writeMonorepoFiles(
+          contexts,
+          config,
+          dryRun,
+          changelogConfig.file ?? 'CHANGELOG.md',
+          fmtOpts.refs ?? 'link',
+        );
         files.push(...monoFiles);
       }
     } catch (error) {
@@ -363,37 +526,33 @@ export async function runPipeline(input: ChangelogInput, config: Config, dryRun:
     }
   }
 
-  if (releaseNotesConfig?.mode) {
-    const fileName = releaseNotesConfig.file ?? 'RELEASE_NOTES.md';
-    const mode = releaseNotesConfig.mode;
-
-    info(`Generating release notes → ${fileName}`);
+  // Release-notes file output is opt-in and always per-version (immutable file per release). Notes
+  // also flow to the GitHub release body via `releaseNotesResult` below regardless of file output.
+  if (!pipelineOptions?.skipReleaseNotes && releaseNotesConfig?.file?.dir) {
+    const dir = releaseNotesConfig.file.dir;
+    info(`Generating release notes → ${dir}`);
 
     try {
-      if (mode === 'root' || mode === 'both') {
-        if (releaseNotesConfig.templates?.path) {
-          await generateWithTemplate(
-            contexts,
-            releaseNotesConfig.templates,
-            fileName,
-            contexts[0]?.repoUrl ?? undefined,
-            dryRun,
-          );
-        } else {
-          writeMarkdown(fileName, contexts, config, dryRun, fmtOpts);
-        }
-        if (!dryRun) files.push(fileName);
-      }
+      const { detectMonorepo } = await import('../monorepo/aggregator.js');
+      // Nest by package whenever the repo has more than one package (a monorepo), so independent
+      // per-package releases — one context per run — can't collide on release-notes/<version>.md.
+      const nested = detectMonorepo(process.cwd()).isMonorepo || contexts.length > 1;
 
-      if (mode === 'packages' || mode === 'both') {
-        const monoFiles = await writeMonorepoFiles(
-          contexts,
-          config,
-          dryRun,
-          releaseNotesConfig.file ?? 'RELEASE_NOTES.md',
-        );
-        files.push(...monoFiles);
-      }
+      // Content precedence: a template (the docs-site frontmatter hook) wins, else LLM prose, else a
+      // clean single-release section. Never the changelog document — release notes aren't a changelog.
+      const renderContent = (ctx: TemplateContext): string => {
+        if (releaseNotesConfig.templates?.path) {
+          const templatePath = path.resolve(releaseNotesConfig.templates.path);
+          const docCtx = { ...createDocumentContext([ctx], undefined), perPackage: true, output: 'file' as const };
+          return renderTemplate(templatePath, docCtx, releaseNotesConfig.templates.engine as TemplateEngine | undefined)
+            .content;
+        }
+        if (ctx.enhanced?.releaseNotes) return ctx.enhanced.releaseNotes;
+        return formatVersion(ctx, fmtOpts);
+      };
+
+      const versionedFiles = writeVersionedNotes(contexts, dir, dryRun, nested, renderContent);
+      files.push(...versionedFiles);
     } catch (error) {
       warn(`Failed to write release notes: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -402,7 +561,14 @@ export async function runPipeline(input: ChangelogInput, config: Config, dryRun:
   const packageNotes: Record<string, string> = {};
   const releaseNotesResult: Record<string, string> = {};
   for (const ctx of contexts) {
-    packageNotes[ctx.packageName] = formatVersion(ctx);
+    // packageNotes is already keyed by package, so it keeps the bare header (no includePackageName);
+    // only the first-release intro is threaded in.
+    packageNotes[ctx.packageName] = formatVersion(ctx, { firstRelease: releaseNotesConfig?.firstRelease });
+    if (pipelineOptions?.skipReleaseNotes) {
+      // Caller asked to skip release notes — don't populate the per-package map either,
+      // otherwise the callsite will treat it as "available" content and propagate it.
+      continue;
+    }
     if (ctx.enhanced?.releaseNotes) {
       releaseNotesResult[ctx.packageName] = ctx.enhanced.releaseNotes;
     } else if (releaseNotesConfig) {
@@ -410,7 +576,7 @@ export async function runPipeline(input: ChangelogInput, config: Config, dryRun:
       if (releaseNotesConfig.templates?.path) {
         try {
           const templatePath = path.resolve(releaseNotesConfig.templates.path);
-          const docCtx = { ...createDocumentContext([ctx], undefined), perPackage: true };
+          const docCtx = { ...createDocumentContext([ctx], undefined), perPackage: true, output: 'release' as const };
           const rendered = renderTemplate(
             templatePath,
             docCtx,
@@ -427,7 +593,7 @@ export async function runPipeline(input: ChangelogInput, config: Config, dryRun:
         info(
           `No LLM release notes or template output for ${ctx.packageName}, using formatted changelog as release notes preview`,
         );
-        releaseNotesResult[ctx.packageName] = formatVersion(ctx);
+        releaseNotesResult[ctx.packageName] = formatVersion(ctx, { firstRelease: releaseNotesConfig?.firstRelease });
       }
     }
   }
@@ -439,9 +605,14 @@ export async function runPipeline(input: ChangelogInput, config: Config, dryRun:
   };
 }
 
-export async function processInput(inputJson: string, config: Config, dryRun: boolean): Promise<PipelineResult> {
+export async function processInput(
+  inputJson: string,
+  config: Config,
+  dryRun: boolean,
+  pipelineOptions?: PipelineOptions,
+): Promise<PipelineResult> {
   const input = parseVersionOutput(inputJson);
-  return runPipeline(input, config, dryRun);
+  return runPipeline(input, config, dryRun, pipelineOptions);
 }
 
 async function writeMonorepoFiles(
@@ -449,6 +620,7 @@ async function writeMonorepoFiles(
   config: Config,
   dryRun: boolean,
   fileName: string,
+  refs: ChangelogRefsMode,
 ): Promise<string[]> {
   const { detectMonorepo, writeMonorepoChangelogs } = await import('../monorepo/aggregator.js');
   const cwd = process.cwd();
@@ -466,6 +638,7 @@ async function writeMonorepoFiles(
     },
     config,
     dryRun,
+    refs,
   );
 
   return monoFiles;

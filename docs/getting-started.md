@@ -4,7 +4,7 @@ This guide walks through installing ReleaseKit, verifying your setup with a dry 
 
 ## Prerequisites
 
-- Node.js 20+
+- Node.js 22+
 - A git repository using [Conventional Commits](https://www.conventionalcommits.org/)
 - At least one git tag marking a previous release (e.g. `v0.0.0`), or no tags at all for a first release
 
@@ -14,13 +14,19 @@ This guide walks through installing ReleaseKit, verifying your setup with a dry 
 
 Install the unified CLI:
 
+**npm:**
+
 ```bash
 npm install -g @releasekit/release
-# or
+```
+
+**pnpm:**
+
+```bash
 pnpm add -g @releasekit/release
 ```
 
-This provides the `releasekit` command. Individual tools (`releasekit-version`, `releasekit-notes`, `releasekit-publish`) are also available if you need them independently.
+This provides the `releasekit` command. Individual tools (`releasekit-version`, `releasekit-notes`, `releasekit-publish`) are also available if you need them independently. See the [CLI reference](./cli.md) for every command and flag.
 
 ---
 
@@ -33,6 +39,8 @@ releasekit init
 ```
 
 Or create it manually. The minimal config for a single-package npm project:
+
+> Comments (`//` and `/* … */`) and trailing commas are supported. Name the file `releasekit.config.jsonc` if you want your editor to accept comments without warnings — both filenames are auto-discovered.
 
 ```json
 {
@@ -161,21 +169,34 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
+          cache: pnpm
           registry-url: 'https://registry.npmjs.org'
-      - run: npm ci
-      - run: npx releasekit release
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec releasekit release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
+
+> **Using npm?** Drop the `pnpm/action-setup` step, set `cache: npm` on `setup-node`, and replace `pnpm install --frozen-lockfile` with `npm ci` and `pnpm exec` with `npx`.
+
+If you use the [label-based trigger](../packages/release/docs/ci-setup.md#label-based-trigger), create the required `bump:*`, `channel:*`, and `release:skip` labels with `releasekit labels sync` — see [Create the labels](../packages/release/docs/ci-setup.md#create-the-labels).
 
 ---
 
 ## Next steps
 
+- **[Architecture](./architecture.md)** — pipeline design, mental model, and how everything fits together
+- **[Release taxonomy](./release-taxonomy.md)** — groups vs prerequisites vs selection, for monorepos with coupled packages
 - **[CI setup guide](../packages/release/docs/ci-setup.md)** — complete workflow recipes
+- **[CLI reference](./cli.md)** — every command and flag
+- **[Configuration reference](./configuration.md)** — all `releasekit.config.json` options
+- **[Troubleshooting](./troubleshooting.md)** — symptom-indexed error guide
 - **[@releasekit/notes — LLM providers](../packages/notes/docs/llm-providers.md)** — add AI-enhanced release notes
 - **[@releasekit/notes — configuration](../packages/notes/docs/configuration.md)** — changelog and release notes options
 - **[@releasekit/publish — GitHub Releases](../packages/publish/docs/github-releases.md)** — release body options
+- **[Rust / Cargo guide](./rust.md)** — Rust crate versioning and crates.io publishing
+- **[Migration guide](./migration.md)** — from semantic-release or changesets

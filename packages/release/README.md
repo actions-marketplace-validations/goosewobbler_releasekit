@@ -1,5 +1,8 @@
 # @releasekit/release
 
+> [!WARNING]
+> 🚧 **Pre-1.0.0** — ReleaseKit is evolving fast and **💥 breaking changes are common**; it's **not production-ready** until `v1.0.0`. Pin exact versions. See the [main README](../../README.md) for details.
+
 [![@releasekit/release](https://img.shields.io/badge/@releasekit-release-9feaf9?labelColor=1a1a1a&style=plastic)](https://www.npmjs.com/package/@releasekit/release)
 [![Version](https://img.shields.io/npm/v/@releasekit/release?color=28a745&labelColor=1a1a1a)](https://www.npmjs.com/package/@releasekit/release)
 [![Downloads](https://img.shields.io/npm/dw/@releasekit/release?color=6f42c1&labelColor=1a1a1a)](https://www.npmjs.com/package/@releasekit/release)
@@ -18,9 +21,15 @@
 
 ## Installation
 
+**npm:**
+
 ```bash
 npm install -g @releasekit/release
-# or
+```
+
+**pnpm:**
+
+```bash
 pnpm add -g @releasekit/release
 ```
 
@@ -60,7 +69,7 @@ If no releasable changes are found after step 1, the command exits with code 0 a
 |------|-------------|---------|
 | `-c, --config <path>` | Path to config file | `releasekit.config.json` |
 | `-d, --dry-run` | Preview all steps without side effects | `false` |
-| `-b, --bump <type>` | Force bump type: `patch`, `minor`, `major` | auto |
+| `-b, --bump <type>` | Force bump type: `patch`, `minor`, `major`, `prerelease` | auto |
 | `-p, --prerelease [id]` | Create prerelease version | — |
 | `-s, --sync` | Synchronized versioning across all packages | `false` |
 | `-t, --target <packages>` | Target specific packages (comma-separated) | all |
@@ -148,7 +157,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: actions/setup-node@v6
-      - run: npm install -g @releasekit/release
+      - run: pnpm add -g @releasekit/release
       - run: releasekit release
 ```
 
@@ -165,7 +174,11 @@ releasekit release --sync
 ### Prerelease workflow
 
 ```bash
+# Create new prerelease from stable version
 releasekit release --prerelease beta
+
+# Increment existing prerelease version
+releasekit release --bump prerelease
 ```
 
 ### Gate mode in CI
@@ -183,7 +196,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - id: gate
-        uses: goosewobbler/releasekit@vX
+        uses: goosewobbler/releasekit@v0
         with:
           mode: gate
 
@@ -267,7 +280,7 @@ The `ci` section controls automation behavior:
 {
   "ci": {
     // How releases are delivered
-    "releaseStrategy": "direct",       // "manual" | "direct" | "standing-pr" | "scheduled"
+    "releaseStrategy": "direct",       // "manual" | "direct" | "standing-pr"
 
     // What triggers a release
     "releaseTrigger": "label",         // "commit" | "label"
@@ -277,9 +290,10 @@ The `ci` section controls automation behavior:
 
     // Customise PR label names
     "labels": {
-      "stable": "release:stable",
-      "prerelease": "release:prerelease",
+      "graduate": "release:graduate",
+      "prerelease": "channel:prerelease",
       "skip": "release:skip",
+      "immediate": "release:immediate",
       "major": "bump:major",
       "minor": "bump:minor",
       "patch": "bump:patch"
@@ -301,7 +315,9 @@ The `ci` section controls automation behavior:
 
 **`commit`** — Conventional commits drive the bump type automatically. Every merge can trigger a release. Use the `release:skip` label to prevent a release, or `bump:major` to override the commit-derived bump to major.
 
-Both modes support `release:stable` and `release:prerelease` as channel modifiers. `release:stable` alone graduates any prerelease packages to their stable base version and skips packages that are already stable — no bump label required. `release:prerelease` must be combined with a `bump:*` label — alone, it does not trigger a release.
+Both modes support `release:graduate` and `channel:prerelease`. `release:graduate` alone graduates any prerelease packages to their stable base version and skips packages that are already stable — no bump label required (it's a standalone release-flow trigger). `channel:prerelease` is a channel modifier and must be combined with a `bump:*` label — alone, it does not trigger a release.
+
+> **Standing-pr strategy is different.** When `releaseStrategy: "standing-pr"`, labels on **feeder PRs** are advisory only — the standing PR itself is the canonical override surface (add `bump:major` etc. to the standing PR to drive the next release). To bypass the queue and ship one PR directly, label it `release:immediate`. See [CI setup → Label semantics in standing-pr mode](./docs/ci-setup.md#label-semantics-in-standing-pr-mode).
 
 #### Release Strategy
 
@@ -309,8 +325,7 @@ Both modes support `release:stable` and `release:prerelease` as channel modifier
 |----------|-------------|
 | `direct` | Release is triggered when a PR is merged to the main branch |
 | `manual` | Releases are triggered manually (e.g. via `workflow_dispatch`) |
-| `standing-pr` | Changes accumulate in a standing release PR *(planned)* |
-| `scheduled` | Releases are triggered on a schedule *(planned)* |
+| `standing-pr` | Changes accumulate in a standing release PR, merged when ready |
 
 #### Scope-Based Release
 
@@ -349,7 +364,7 @@ Multiple scope labels are combined with OR logic. Without a `release:*` label, c
 
 In label trigger mode, conflicting labels will block the release and post a comment explaining the issue:
 - Multiple bump labels (`bump:major` + `bump:minor` + `bump:patch`) → blocked
-- Conflicting release type (`release:stable` + `release:prerelease`) → blocked (both modes)
+- Conflicting release type (`release:graduate` + `channel:prerelease`) → blocked (both modes)
 
 **How it works:**
 
@@ -364,7 +379,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: goosewobbler/releasekit@v1
+      - uses: goosewobbler/releasekit@v0
         with:
           mode: release
           # Fallback target - used when no scope label is found
@@ -372,6 +387,35 @@ jobs:
 ```
 
 With this setup, releasekit will use the specified packages as fallback. When a PR has a scope label, it will be used instead to filter to just those packages.
+
+#### Standing PR Configuration
+
+When `releaseStrategy: "standing-pr"`, the `ci.standingPr` block tunes the bot-maintained release PR. All keys are optional.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `branch` | `release/next` | Bot-maintained release branch name. Force-reset to `main` on every update. |
+| `title` | `chore: release ${count} package(s)` | PR title template. Variables: `${count}`, `${version}`. Must start with a string matching `release.ci.skipPatterns` (default `chore: release `). |
+| `labels` | `["release"]` | Labels applied to the PR. Maintainer-added `bump:*` / `scope:*` / `channel:*` labels on the standing PR are preserved across updates and drive the next release as overrides — see [Label semantics in standing-pr mode](./docs/ci-setup.md#label-semantics-in-standing-pr-mode). |
+| `deleteBranchOnMerge` | `true` | Delete the release branch after publish completes. |
+| `mergeMethod` | `merge` | `merge` \| `squash` \| `rebase`. |
+| `minAge` | (unset) | Duration string (`6h`, `30m`, `1d`). Until elapsed, `releasekit/standing-pr` status check reports `pending`. |
+| `minPackages` | (unset) | Minimum distinct packages with releasable changes before a standing PR is created. Below threshold, an existing PR is closed. |
+
+```json
+{
+  "ci": {
+    "releaseStrategy": "standing-pr",
+    "standingPr": {
+      "branch": "release/next",
+      "mergeMethod": "squash",
+      "minAge": "6h"
+    }
+  }
+}
+```
+
+See [CI setup — Standing Release PR](./docs/ci-setup.md#standing-release-pr) for prerequisites (required GitHub repo setting, secrets), the workflow YAML, lifecycle behaviour, and troubleshooting.
 
 ### PR Preview
 
@@ -409,10 +453,10 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Release preview
-        run: npx releasekit preview
+        run: pnpm exec releasekit preview
         env:
           GITHUB_TOKEN: ${{ github.token }}
 ```

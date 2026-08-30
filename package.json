@@ -1,6 +1,6 @@
 {
   "name": "releasekit-monorepo",
-  "version": "0.12.0",
+  "version": "0.41.2",
   "private": true,
   "type": "module",
   "description": "Release tooling for automated versioning and changelog generation",
@@ -11,7 +11,7 @@
   "license": "MIT",
   "author": "Sam Maister <goosewobbler@protonmail.com>",
   "engines": {
-    "node": ">=20",
+    "node": ">=22",
     "pnpm": ">=10.12.0"
   },
   "packageManager": "pnpm@10.27.0+sha512.72d699da16b1179c14ba9e64dc71c9a40988cbdc65c264cb0e489db7de917f20dcf4d64d8723625f2969ba52d4b7e2a1170682d9ac2a5dcaeaab732b7e16f04a",
@@ -25,35 +25,45 @@
     "test:action": "node scripts/test-harness/index.mjs",
     "test:action:preview": "node scripts/test-harness/index.mjs preview",
     "test:action:release": "node scripts/test-harness/index.mjs release --bump patch",
-    "lint": "biome check --formatter-enabled=false --linter-enabled=true . && eslint --cache \"packages/**/*.ts\"",
-    "lint:fix": "biome check --write --formatter-enabled=false --linter-enabled=true .",
+    "test:harness:multi": "node scripts/test-harness/index.mjs release-multi",
+    "test:harness:multi-npm-disabled": "node scripts/test-harness/index.mjs release-multi-npm-disabled",
+    "test:harness:backfill": "node scripts/test-harness/index.mjs backfill",
+    "lint": "biome check . && eslint --cache \"packages/**/*.ts\"",
+    "lint:fix": "biome check --write .",
     "format": "biome format --write .",
-    "format:check": "biome check --formatter-enabled=true --linter-enabled=false .",
     "typecheck": "turbo run typecheck",
     "clean": "turbo run clean && rm -rf node_modules",
     "clean:cache": "turbo daemon stop && rm -rf .turbo .eslintcache",
+    "schema:gen": "tsx scripts/generate-schema.ts",
+    "schema:check": "tsx scripts/generate-schema.ts --check",
+    "docs:config": "tsx scripts/generate-config-docs.ts",
+    "docs:check": "tsx scripts/generate-config-docs.ts --check",
+    "examples:smoke:generate": "tsx scripts/examples-smoke/generate-smoke-workflow.ts",
+    "examples:smoke:check": "tsx scripts/examples-smoke/generate-smoke-workflow.ts --check",
     "prepare": "husky"
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",
     "@types/node": "catalog:",
-    "@typescript-eslint/parser": "^8.58.0",
-    "@vitest/eslint-plugin": "^1.6.14",
-    "eslint": "^10.2.0",
+    "@typescript-eslint/parser": "^8.65.0",
+    "@vitest/eslint-plugin": "^1.6.24",
+    "eslint": "^10.8.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
     "tsup": "catalog:",
     "tsx": "catalog:",
-    "turbo": "2.9.4",
-    "typescript": "catalog:"
+    "turbo": "2.10.7",
+    "typescript": "catalog:",
+    "yaml": "catalog:",
+    "zod": "catalog:"
   },
   "lint-staged": {
     "**/*.ts": [
-      "biome check --write",
+      "biome check --write --no-errors-on-unmatched --files-ignore-unknown=true",
       "eslint --fix --cache"
     ],
-    "**/*.{md,json}": [
-      "biome format --write"
+    "**/*.{md,json,jsonc}": [
+      "biome format --write --no-errors-on-unmatched --files-ignore-unknown=true"
     ]
   }
 }

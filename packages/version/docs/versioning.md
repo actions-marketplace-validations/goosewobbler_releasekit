@@ -4,9 +4,9 @@
 
 ## How the Next Version is Calculated
 
-There are two primary methods the tool uses to decide the version bump (e.g., patch, minor, major), configured via the `versionStrategy` option in `releasekit.config.json`:
+The tool decides the version bump (e.g., patch, minor, major) from your Git history using Conventional Commits:
 
-### 1. Conventional Commits (`versionStrategy: "conventional"`)
+### Conventional Commits
 
 This is the default strategy. `releasekit-version` analyzes Git commit messages since the last Git tag that follows semver patterns. It uses the [conventional-commits](https://www.conventionalcommits.org/) specification to determine the bump:
 
@@ -34,36 +34,6 @@ The specific preset used for analysis (e.g., "angular", "conventional") can be s
 
 -   [https://www.conventionalcommits.org/](https://www.conventionalcommits.org/)
 -   [https://github.com/conventional-changelog/conventional-changelog](https://github.com/conventional-changelog/conventional-changelog)
-
-### 2. Branch Pattern (`versionStrategy: "branchPattern"`)
-
-This strategy uses the name of the current Git branch (or the most recently merged branch matching a pattern, if applicable) to determine the version bump.
-
-You define patterns in the `branchPattern` array in `releasekit.config.json`. Each pattern is a string like `"prefix:bumptype"`.
-
-**Example `releasekit.config.json`:**
-
-```json
-{
-  "versionStrategy": "branchPattern",
-  "branchPattern": [
-    "feature:minor",
-    "hotfix:patch",
-    "fix:patch",
-    "release:major" 
-  ],
-  "baseBranch": "main" 
-}
-```
-
-**How it works:**
-
-1.  The tool checks the current branch name.
-2.  It might also look for the most recently merged branch into `baseBranch` that matches any pattern in `branchPattern`.
-3.  It compares the relevant branch name (current or last merged) against the prefixes in `branchPattern`.
-4.  If a match is found (e.g., current branch is `feature/add-login`), it applies the corresponding bump type (`minor` in this case).
-
-This allows you to enforce version bumps based on your branching workflow (e.g., all branches starting with `feature/` result in a minor bump).
 
 ## Package Type Support
 
@@ -436,7 +406,7 @@ While primarily used for single packages now, `releasekit-version` retains optio
 
 This is the default if the `sync` flag is present and true.
 
--   **Behaviour:** The tool calculates **one** version bump based on the overall history (or branch pattern). This single new version is applied to **all** packages within the repository (or just the root `package.json` if not a structured monorepo). A single Git tag is created.
+-   **Behaviour:** The tool calculates **one** version bump based on the overall history. This single new version is applied to **all** packages within the repository (or just the root `package.json` if not a structured monorepo). A single Git tag is created.
 -   **Tag Behaviour:** 
     - In **multi-package monorepos**: Creates global tags like `v1.2.3` regardless of `packageSpecificTags` setting
     - In **single-package repositories**: Respects the `packageSpecificTags` setting - can create either `v1.2.3` or `package-name@v1.2.3`
@@ -471,7 +441,8 @@ Use the `--prerelease` flag with an identifier to create a prerelease version:
 
 ```bash
 # Create a beta prerelease
-npx releasekit-version --bump minor --prerelease beta
+pnpm exec releasekit-version --bump minor --prerelease beta
+# or: npx releasekit-version --bump minor --prerelease beta
 # Result: 1.0.0 -> 1.1.0-beta.0
 ```
 
@@ -489,7 +460,8 @@ When using standard bump types (`major`, `minor`, `patch`) with the `--bump` fla
 
 ```bash
 # Starting from version 1.0.0-beta.1
-npx releasekit-version --bump major
+pnpm exec releasekit-version --bump major
+# or: npx releasekit-version --bump major
 # Result: 1.0.0-beta.1 -> 2.0.0 (not 2.0.0-beta.0)
 ```
 
@@ -499,3 +471,28 @@ This applies to all standard bump types:
 - `--bump major`: 1.0.0-beta.1 -> 2.0.0
 - `--bump minor`: 1.0.0-beta.1 -> 1.1.0 
 - `--bump patch`: 1.0.0-beta.1 -> 1.0.1
+
+### First Releases (no prior tag)
+
+When a package has no tag yet, ReleaseKit takes the version in its manifest as the **floor** and bumps **up** from it (the source selection above, with nothing on the git side to compare against). Two things on a first release surprise people:
+
+**Graduating to a stable `X.Y.Z`.** A stable release graduates a *prerelease* floor to its stable form and ignores the bump — but if the floor is *already* stable there is nothing to graduate, so the bump is applied and the result overshoots:
+
+| Manifest floor | Stable release | Result |
+| --- | --- | --- |
+| `1.0.0-next.0` | `--bump major --stable` | `1.0.0` (graduated; bump ignored) |
+| `1.0.0` | `--bump major --stable` | `2.0.0` — overshoot |
+| `1.0.0` | `--bump patch --stable` | `1.0.1` — overshoot |
+
+So to publish a first stable release as exactly `X.Y.Z`, stage the manifest at `X.Y.Z-next.0` and graduate — not at a bare `X.Y.Z`.
+
+**Starting a prerelease line at `.0`.** `--bump prerelease` only *increments* an existing prerelease counter, so it cannot produce `…-next.0` from a `…-next.0` floor — it steps to `.1`. To land the first published prerelease on `X.Y.Z-<id>.0`, set the floor *below* it and bump up:
+
+| Manifest floor | Prerelease release | Result |
+| --- | --- | --- |
+| `1.0.0-next.0` | `--bump prerelease` | `1.0.0-next.1` |
+| `0.0.1` | `--bump premajor --prerelease next` | `1.0.0-next.0` |
+
+After the first publish the new tag becomes the floor; subsequent prereleases increment normally (`next.1`, `next.2`, …) and `--stable` graduates the line when ready.
+
+The stable-floor overshoot is currently silent in the summary (the graduate-vs-bump decision shows only under verbose logging) — staging at `X.Y.Z-next.0` avoids it. See also [`--stable`](../../../docs/cli.md) and [`version.zeroMajor`](../../../docs/configuration.md#versionzeromajor) for related pre-1.0 behaviour.

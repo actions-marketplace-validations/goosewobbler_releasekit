@@ -5,7 +5,7 @@
  */
 
 import type { VersionChangelogEntry } from '@releasekit/core';
-import { execSync } from '../git/commandExecutor.js';
+import { createGitCli, type Git } from '@releasekit/git';
 import { log } from '../utils/logging.js';
 
 type ChangelogEntry = VersionChangelogEntry;
@@ -14,6 +14,12 @@ type ChangelogEntry = VersionChangelogEntry;
 const CONVENTIONAL_COMMIT_REGEX = /^(\w+)(?:\(([^)]+)\))?(!)?: (.+)(?:\n\n([\s\S]*))?/;
 // Regular expression to extract breaking change notes
 const BREAKING_CHANGE_REGEX = /BREAKING CHANGE: ([\s\S]+?)(?:\n\n|$)/;
+// Free-form (non-conventional) subjects that are pure version-sync / release bookkeeping and carry no
+// changelog signal — e.g. `Update version to 1.2.3`, `update package versions across multiple
+// packages` — leaked in as `Changed` entries. Only applied to the non-conventional fallback
+// branch, and narrow by construction (`version to <digit>` / `package versions`) so a real code
+// change like "update version handling in the parser" is never swallowed.
+const VERSION_BUMP_SUBJECT_REGEX = /^update (?:version to v?\d|package versions)\b/i;
 
 /**
  * Extract changelog entries from Git commits (with commit hashes for tracking)
@@ -23,10 +29,22 @@ export interface CommitWithHash {
   entry: ChangelogEntry;
 }
 
-export function extractChangelogEntriesWithHash(projectDir: string, revisionRange: string): CommitWithHash[] {
+export async function extractChangelogEntriesWithHash(
+  projectDir: string,
+  revisionRange: string,
+  git: Git = createGitCli(),
+): Promise<CommitWithHash[]> {
   try {
-    const args = ['log', revisionRange, '--pretty=format:%H|||%B---COMMIT_DELIMITER---', '--no-merges', '--', '.'];
-    const output = execSync('git', args, { cwd: projectDir, encoding: 'utf8' }).toString();
+    // `--format=` (tformat) vs the old `--pretty=format:` differ only by a trailing newline, which
+    // the delimiter split/trim below absorbs — the parsed result is identical. `--` `.` restricts to
+    // commits touching this directory.
+    const output = await git.log({
+      range: revisionRange,
+      format: '%H|||%B---COMMIT_DELIMITER---',
+      extraArgs: ['--no-merges'],
+      paths: ['.'],
+      cwd: projectDir,
+    });
 
     const commits = output.split('---COMMIT_DELIMITER---').filter((commit) => commit.trim() !== '');
 
@@ -48,10 +66,19 @@ export function extractChangelogEntriesWithHash(projectDir: string, revisionRang
   }
 }
 
-export function extractAllChangelogEntriesWithHash(projectDir: string, revisionRange: string): CommitWithHash[] {
+export async function extractAllChangelogEntriesWithHash(
+  projectDir: string,
+  revisionRange: string,
+  git: Git = createGitCli(),
+): Promise<CommitWithHash[]> {
   try {
-    const args = ['log', revisionRange, '--pretty=format:%H|||%B---COMMIT_DELIMITER---', '--no-merges'];
-    const output = execSync('git', args, { cwd: projectDir, encoding: 'utf8' }).toString();
+    // No path filter — repo-wide history (used to classify repo-level vs package commits).
+    const output = await git.log({
+      range: revisionRange,
+      format: '%H|||%B---COMMIT_DELIMITER---',
+      extraArgs: ['--no-merges'],
+      cwd: projectDir,
+    });
 
     const commits = output.split('---COMMIT_DELIMITER---').filter((commit) => commit.trim() !== '');
 
@@ -81,26 +108,20 @@ export function extractAllChangelogEntriesWithHash(projectDir: string, revisionR
  * @param sharedPackageDirs Array of shared package directory paths that should be treated as repo-level (e.g., ['packages/config', 'packages/core'])
  * @returns true if the commit touches any non-shared package directory
  */
-export function commitTouchesAnyPackage(
+export async function commitTouchesAnyPackage(
   projectDir: string,
   commitHash: string,
   packageDirs: string[],
   sharedPackageDirs: string[] = [],
-): boolean {
+  git: Git = createGitCli(),
+): Promise<boolean> {
   try {
-    // Get the list of files changed in this commit
-    const output = execSync('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', commitHash], {
-      cwd: projectDir,
-      encoding: 'utf8',
-    })
-      .toString()
-      .trim();
+    // Get the list of files changed in this commit (already trimmed/split, empties dropped).
+    const changedFiles = await git.diffTreeNames(commitHash, projectDir);
 
-    if (!output) {
+    if (changedFiles.length === 0) {
       return false;
     }
-
-    const changedFiles = output.split('\n');
 
     // Check if any changed file is within any non-shared package directory
     return changedFiles.some((file) => {
@@ -132,21 +153,24 @@ export function commitTouchesAnyPackage(
  * @param sharedPackageDirs Array of shared package directory paths that should be treated as repo-level
  * @returns Array of repo-level changelog entries
  */
-export function extractRepoLevelChangelogEntries(
+export async function extractRepoLevelChangelogEntries(
   projectDir: string,
   revisionRange: string,
   packageDirs: string[],
   sharedPackageDirs: string[] = [],
-): ChangelogEntry[] {
+  git: Git = createGitCli(),
+): Promise<ChangelogEntry[]> {
   try {
     // Get all commits with hashes
-    const allCommits = extractAllChangelogEntriesWithHash(projectDir, revisionRange);
+    const allCommits = await extractAllChangelogEntriesWithHash(projectDir, revisionRange, git);
 
-    // Filter to only commits that don't touch any non-shared package directory
-    const repoLevelCommits = allCommits.filter((commit) => {
-      const touchesPackage = commitTouchesAnyPackage(projectDir, commit.hash, packageDirs, sharedPackageDirs);
-      return !touchesPackage;
-    });
+    // Filter to only commits that don't touch any non-shared package directory. The touches-package
+    // check is async (diff-tree per commit), so resolve them all first, then filter synchronously to
+    // preserve order.
+    const touches = await Promise.all(
+      allCommits.map((commit) => commitTouchesAnyPackage(projectDir, commit.hash, packageDirs, sharedPackageDirs, git)),
+    );
+    const repoLevelCommits = allCommits.filter((_commit, i) => !touches[i]);
 
     if (repoLevelCommits.length > 0) {
       log(
@@ -168,8 +192,12 @@ export function extractRepoLevelChangelogEntries(
  * @param revisionRange Git revision range (e.g., "v1.0.0..v1.1.0" or tag name)
  * @returns Array of changelog entries
  */
-export function extractChangelogEntriesFromCommits(projectDir: string, revisionRange: string): ChangelogEntry[] {
-  return extractCommitsFromGitLog(projectDir, revisionRange, true);
+export function extractChangelogEntriesFromCommits(
+  projectDir: string,
+  revisionRange: string,
+  git: Git = createGitCli(),
+): Promise<ChangelogEntry[]> {
+  return extractCommitsFromGitLog(projectDir, revisionRange, true, git);
 }
 
 /**
@@ -178,17 +206,28 @@ export function extractChangelogEntriesFromCommits(projectDir: string, revisionR
  * @param revisionRange Git revision range (e.g., "v1.0.0..v1.1.0" or tag name)
  * @returns Array of changelog entries (including global commits not tied to any package)
  */
-export function extractAllChangelogEntries(projectDir: string, revisionRange: string): ChangelogEntry[] {
-  return extractCommitsFromGitLog(projectDir, revisionRange, false);
+export function extractAllChangelogEntries(
+  projectDir: string,
+  revisionRange: string,
+  git: Git = createGitCli(),
+): Promise<ChangelogEntry[]> {
+  return extractCommitsFromGitLog(projectDir, revisionRange, false, git);
 }
 
-function extractCommitsFromGitLog(projectDir: string, revisionRange: string, filterToPath: boolean): ChangelogEntry[] {
+async function extractCommitsFromGitLog(
+  projectDir: string,
+  revisionRange: string,
+  filterToPath: boolean,
+  git: Git = createGitCli(),
+): Promise<ChangelogEntry[]> {
   try {
-    const args = ['log', revisionRange, '--pretty=format:%B---COMMIT_DELIMITER---', '--no-merges'];
-    if (filterToPath) {
-      args.push('--', '.');
-    }
-    const output = execSync('git', args, { cwd: projectDir, encoding: 'utf8' }).toString();
+    const output = await git.log({
+      range: revisionRange,
+      format: '%B---COMMIT_DELIMITER---',
+      extraArgs: ['--no-merges'],
+      paths: filterToPath ? ['.'] : undefined,
+      cwd: projectDir,
+    });
 
     // Split by commit delimiter and remove empty commits
     const commits = output.split('---COMMIT_DELIMITER---').filter((commit) => commit.trim() !== '');
@@ -246,16 +285,23 @@ function parseCommitMessage(message: string): ChangelogEntry | null {
     // Map conventional commit type to changelog type
     const changelogType = mapCommitTypeToChangelogType(type);
 
-    // Skip certain commit types that usually aren't relevant to the changelog
-    if (!changelogType) {
-      return null;
-    }
+    // GitHub appends `(#N)` to the squash-merge subject — that's the PR. Pull it off the subject so it
+    // renders as a labelled PR ref instead of a bare inline autolink GitHub expands into a rich card,
+    // and record the number so the changelog can tell PR from closed issue.
+    const subjectRaw = subject ?? '';
+    const prMatch = subjectRaw.match(/\s*\(#(\d+)\)\s*$/);
+    const prNumber = prMatch ? `#${prMatch[1]}` : undefined;
+    const subjectText = prMatch ? subjectRaw.slice(0, prMatch.index).trimEnd() : subjectRaw;
 
-    // Extract issue IDs from footer (assuming format like "Fixes #123")
-    const issueIds = extractIssueIds(body);
+    // eslint-disable-next-line local/no-bare-issue-refs -- the "Fixes" footer example on the next line is a format sample, not a citation
+    // Extract issue IDs from footer (assuming format like "Fixes #123"). issueIds is the full flat
+    // list: the PR (when present) plus the closed issues, so a consumer that ignores prNumber still
+    // shows every ref.
+    const bodyIssueIds = extractIssueIds(body);
+    const issueIds = prNumber ? [prNumber, ...bodyIssueIds] : bodyIssueIds;
 
     // Format description, adding BREAKING prefix if needed
-    let description = subject;
+    let description = subjectText;
     if (hasBreakingChange) {
       description = `**BREAKING** ${description}`;
     }
@@ -265,13 +311,19 @@ function parseCommitMessage(message: string): ChangelogEntry | null {
       description,
       scope: scope || undefined,
       issueIds: issueIds.length > 0 ? issueIds : undefined,
+      prNumber,
       originalType: type, // Store original type for custom formatting
     };
   }
 
   // Non-conventional commit - try to extract basic information
-  // Only include if it seems meaningful (not just a merge or version bump)
-  if (!trimmedMessage.startsWith('Merge') && !trimmedMessage.match(/^v?\d+\.\d+\.\d+/)) {
+  // Only include if it seems meaningful (not a merge, a bare version tag, or a version-sync /
+  // release-bump bookkeeping subject).
+  if (
+    !trimmedMessage.startsWith('Merge') &&
+    !trimmedMessage.match(/^v?\d+\.\d+\.\d+/) &&
+    !VERSION_BUMP_SUBJECT_REGEX.test(trimmedMessage)
+  ) {
     const firstLine = trimmedMessage.split('\n')[0].trim();
     return {
       type: 'changed',
@@ -285,7 +337,7 @@ function parseCommitMessage(message: string): ChangelogEntry | null {
 /**
  * Map conventional commit type to changelog entry type
  */
-function mapCommitTypeToChangelogType(type: string): ChangelogEntry['type'] | null {
+function mapCommitTypeToChangelogType(type: string): ChangelogEntry['type'] {
   switch (type) {
     case 'feat':
       return 'added';
@@ -304,8 +356,9 @@ function mapCommitTypeToChangelogType(type: string): ChangelogEntry['type'] | nu
       // Special case - depend on commit message
       return 'changed';
     case 'test':
-      // Usually test changes are not in changelog
-      return null;
+      // Surfaced as "Changed", not dropped: ReleaseKit lists every merged change (low-signal ones are
+      // demoted, not hidden). Excluding test alone undercounted the standing-PR preview.
+      return 'changed';
     default:
       // For unknown types, put in 'changed'
       return 'changed';

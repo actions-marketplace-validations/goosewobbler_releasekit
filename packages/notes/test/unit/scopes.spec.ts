@@ -66,9 +66,10 @@ describe('resolveAllowedScopes()', () => {
     expect(resolveAllowedScopes({ mode: 'none' })).toEqual([]);
   });
 
-  it('should return package names for packages mode', () => {
-    const result = resolveAllowedScopes({ mode: 'packages' }, undefined, ['@acme/core', '@acme/ui']);
-    expect(result).toEqual(['@acme/core', '@acme/ui']);
+  it('should return package names and their short forms for packages mode', () => {
+    const result = resolveAllowedScopes({ mode: 'packages' }, undefined, ['@acme/core', 'standalone']);
+    // Full name, unscoped form, and bare short name — so a commit scoped `core` matches `@acme/core`.
+    expect(result).toEqual(expect.arrayContaining(['@acme/core', 'acme/core', 'core', 'standalone']));
   });
 
   it('should return empty array for packages mode without package names', () => {
@@ -139,24 +140,12 @@ describe('validateScope()', () => {
   });
 
   it('should be case-sensitive when configured', () => {
-    expect(validateScope('ci', ['CI'], { caseSensitive: true })).toBeUndefined();
-    expect(validateScope('CI', ['CI'], { caseSensitive: true })).toBe('CI');
+    expect(validateScope('ci', ['CI'], true)).toBeUndefined();
+    expect(validateScope('CI', ['CI'], true)).toBe('CI');
   });
 
-  it('should remove invalid scopes by default', () => {
+  it('should return undefined for invalid scopes (no fallback behavior)', () => {
     expect(validateScope('Invalid', ['CI', 'Dependencies'])).toBeUndefined();
-  });
-
-  it('should keep invalid scopes when invalidScopeAction is keep', () => {
-    expect(validateScope('Invalid', ['CI'], { invalidScopeAction: 'keep' })).toBe('Invalid');
-  });
-
-  it('should return fallback scope when invalidScopeAction is fallback', () => {
-    expect(validateScope('Invalid', ['CI'], { invalidScopeAction: 'fallback', fallbackScope: 'Other' })).toBe('Other');
-  });
-
-  it('should return undefined for fallback without fallbackScope set', () => {
-    expect(validateScope('Invalid', ['CI'], { invalidScopeAction: 'fallback' })).toBeUndefined();
   });
 });
 
@@ -171,34 +160,130 @@ describe('validateEntryScopes()', () => {
     { type: 'changed', description: 'No scope' },
   ];
 
-  it('should return entries unchanged when scopeConfig is undefined', () => {
+  it('should return valid result when scopeConfig is undefined', () => {
     const result = validateEntryScopes(entries, undefined);
-    expect(result).toBe(entries);
+    expect(result.valid).toBe(true);
+    expect(result.entries).toBe(entries);
+    expect(result.errors).toHaveLength(0);
   });
 
-  it('should return entries unchanged for unrestricted mode', () => {
+  it('should return valid result for unrestricted mode', () => {
     const result = validateEntryScopes(entries, { mode: 'unrestricted' });
-    expect(result).toBe(entries);
+    expect(result.valid).toBe(true);
+    expect(result.entries).toBe(entries);
+    expect(result.errors).toHaveLength(0);
   });
 
-  it('should remove all scopes for none mode', () => {
+  it('should use packageNames as the allow-list for packages mode', () => {
+    const result = validateEntryScopes(entries, { mode: 'packages' }, undefined, ['CI', 'core']);
+    expect(result.valid).toBe(true);
+    // 'CI' is a workspace package name → kept; 'InvalidScope' is not → removed (default action).
+    expect(result.entries[0]?.scope).toBe('CI');
+    expect(result.entries[1]?.scope).toBeUndefined();
+    expect(result.errors).toHaveLength(1);
+  });
+
+  it('should strip all scopes in packages mode when no packageNames are provided', () => {
+    const result = validateEntryScopes(entries, { mode: 'packages' });
+    expect(result.entries[0]?.scope).toBeUndefined();
+    expect(result.entries[1]?.scope).toBeUndefined();
+  });
+
+  it('should strip all scopes for none mode (and remain valid — invalidScopeAction defines resolution)', () => {
     const result = validateEntryScopes(entries, { mode: 'none' });
-    expect(result[0]?.scope).toBeUndefined();
-    expect(result[1]?.scope).toBeUndefined();
-    expect(result[2]?.scope).toBeUndefined();
+    expect(result.valid).toBe(true);
+    expect(result.entries[0]?.scope).toBeUndefined();
+    expect(result.entries[1]?.scope).toBeUndefined();
+    expect(result.entries[2]?.scope).toBeUndefined();
+    // Errors still surface for logging — both entries with original scopes triggered them
+    expect(result.errors).toHaveLength(2);
   });
 
-  it('should validate scopes against allowed list for restricted mode', () => {
+  it('should remove invalid scopes and report errors for logging (default action)', () => {
     const categories: LLMCategory[] = [{ name: 'Developer', description: 'Internal', scopes: ['CI', 'Dependencies'] }];
     const result = validateEntryScopes(entries, { mode: 'restricted' }, categories);
-    expect(result[0]?.scope).toBe('CI');
-    expect(result[1]?.scope).toBeUndefined(); // InvalidScope not in allowed list
-    expect(result[2]?.scope).toBeUndefined(); // no scope
+    // Validation passes — `invalidScopeAction` (default `remove`) defines resolution; no retry.
+    expect(result.valid).toBe(true);
+    expect(result.entries[0]?.scope).toBe('CI'); // valid, kept
+    expect(result.entries[1]?.scope).toBeUndefined(); // invalid, removed
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]?.providedScope).toBe('InvalidScope');
+    expect(result.errors[0]?.entryIndex).toBe(1);
+  });
+
+  it('should keep invalid scopes when invalidScopeAction is "keep"', () => {
+    const categories: LLMCategory[] = [{ name: 'Developer', description: 'Internal', scopes: ['CI', 'Dependencies'] }];
+    const result = validateEntryScopes(
+      entries,
+      { mode: 'restricted', rules: { invalidScopeAction: 'keep' } },
+      categories,
+    );
+    expect(result.valid).toBe(true);
+    expect(result.entries[0]?.scope).toBe('CI');
+    expect(result.entries[1]?.scope).toBe('InvalidScope'); // kept as-is
+    expect(result.errors).toHaveLength(1);
+  });
+
+  it('should replace invalid scopes with fallbackScope when invalidScopeAction is "fallback"', () => {
+    const categories: LLMCategory[] = [{ name: 'Developer', description: 'Internal', scopes: ['CI', 'Dependencies'] }];
+    const result = validateEntryScopes(
+      entries,
+      { mode: 'restricted', rules: { invalidScopeAction: 'fallback', fallbackScope: 'Other' } },
+      categories,
+    );
+    expect(result.valid).toBe(true);
+    expect(result.entries[0]?.scope).toBe('CI');
+    expect(result.entries[1]?.scope).toBe('Other'); // replaced with fallback
+    expect(result.errors).toHaveLength(1);
+  });
+
+  it('should set scope to undefined when fallback action is set without fallbackScope', () => {
+    const categories: LLMCategory[] = [{ name: 'Developer', description: 'Internal', scopes: ['CI', 'Dependencies'] }];
+    const result = validateEntryScopes(
+      entries,
+      { mode: 'restricted', rules: { invalidScopeAction: 'fallback' } },
+      categories,
+    );
+    expect(result.valid).toBe(true);
+    expect(result.entries[1]?.scope).toBeUndefined();
+  });
+
+  it('should warn when fallbackScope is set but not in the allow list', async () => {
+    // @releasekit/core's `warn` writes to console.error (all log lines go via stderr)
+    const messages: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      messages.push(args.map(String).join(' '));
+    };
+    try {
+      const categories: LLMCategory[] = [
+        { name: 'Developer', description: 'Internal', scopes: ['CI', 'Dependencies'] },
+      ];
+      validateEntryScopes(
+        entries,
+        { mode: 'restricted', rules: { invalidScopeAction: 'fallback', fallbackScope: 'NotAllowed' } },
+        categories,
+      );
+    } finally {
+      console.error = originalError;
+    }
+    expect(messages.some((m) => m.includes('fallbackScope') && m.includes('NotAllowed'))).toBe(true);
+  });
+
+  it('should return valid result when all scopes are valid', () => {
+    const validEntries: ChangelogEntry[] = [
+      { type: 'added', description: 'Update CI', scope: 'CI' },
+      { type: 'changed', description: 'No scope' },
+    ];
+    const categories: LLMCategory[] = [{ name: 'Developer', description: 'Internal', scopes: ['CI', 'Dependencies'] }];
+    const result = validateEntryScopes(validEntries, { mode: 'restricted' }, categories);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toHaveLength(0);
   });
 
   it('should not mutate original entries', () => {
     const result = validateEntryScopes(entries, { mode: 'none' });
     expect(entries[0]?.scope).toBe('CI'); // original unchanged
-    expect(result[0]?.scope).toBeUndefined(); // new copy changed
+    expect(result.entries[0]?.scope).toBeUndefined(); // new copy changed
   });
 });

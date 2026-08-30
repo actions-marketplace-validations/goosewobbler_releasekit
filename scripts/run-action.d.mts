@@ -19,6 +19,7 @@ export interface ActionInputs {
   skipGit?: string;
   skipGithubRelease?: string;
   skipVerification?: string;
+  reconcile?: string;
   pr?: string;
   repo?: string;
   previewPrerelease?: string;
@@ -32,18 +33,24 @@ export interface RunActionOptions {
 
 export function buildReleaseArgs(input: ActionInputs): string[];
 export function buildPreviewArgs(input: ActionInputs): string[];
+export function buildRefreshAfterReleaseArgs(input: ActionInputs): string[];
 export function parseReleaseOutput(
   stdout: string,
-): { versionOutput?: { tags?: string[]; updates?: unknown[] } } | undefined;
+): { versionOutput?: { tags?: string[]; updates?: unknown[] } } | null | undefined;
+export function resolveReleaseTags(args: { parsedTags?: string[]; gitTags?: string[]; allowRecovery?: boolean }): {
+  tags: string[];
+  recovered: boolean;
+};
 export function parseInputs(env?: NodeJS.ProcessEnv | Record<string, string | undefined>): ActionInputs;
 export function runAction(
   input: ActionInputs,
   options?: RunActionOptions,
-): {
+): Promise<{
   mode: string;
   args: string[];
   status: number | null;
-  stdout?: string;
-  stderr?: string;
-  error?: Error;
-};
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  outputJson: string;
+}>;

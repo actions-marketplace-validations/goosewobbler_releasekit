@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { isCargoToml, updateCargoVersion } from '../cargo/cargoHandler.js';
+import { isPubspecYaml, updatePubVersion } from '../pub/pubHandler.js';
 import type { PkgJson } from '../types.js';
 import { addPackageUpdate, recordPendingWrite } from '../utils/jsonOutput.js';
 import { log } from '../utils/logging.js';
@@ -111,11 +112,18 @@ Then optionally use the "packages" config to target specific package names:
 
 /**
  * Update a package file (package.json or Cargo.toml) with a new version
+ * @param isRoot True when updating the workspace-root package.json in lockstep (sync mode)
  */
-export function updatePackageVersion(packagePath: string, version: string, dryRun = false): void {
+export function updatePackageVersion(packagePath: string, version: string, dryRun = false, isRoot = false): void {
   // Handle Cargo.toml files separately
   if (isCargoToml(packagePath)) {
     updateCargoVersion(packagePath, version, dryRun);
+    return;
+  }
+
+  // Handle pubspec.yaml files separately
+  if (isPubspecYaml(packagePath)) {
+    updatePubVersion(packagePath, version, dryRun);
     return;
   }
 
@@ -133,7 +141,7 @@ export function updatePackageVersion(packagePath: string, version: string, dryRu
     }
 
     // Track update for JSON output
-    addPackageUpdate(packageName, version, packagePath);
+    addPackageUpdate(packageName, version, packagePath, isRoot);
 
     log(
       `${dryRun ? '[DRY RUN] Would update' : 'Updated'} package.json at ${packagePath} to version ${version}`,

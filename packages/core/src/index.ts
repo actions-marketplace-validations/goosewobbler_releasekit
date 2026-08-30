@@ -1,5 +1,30 @@
+export { findCargoLockfile } from './cargo.js';
+export {
+  type ChangelogRefsMode,
+  escapeChangelogMentions,
+  neutralizeDescriptionRefs,
+  parseGitHubOwnerRepo,
+  renderIssueRefs,
+} from './changelogRefs.js';
 export { readPackageVersion } from './cli.js';
-export { EXIT_CODES, type ExitCode, ReleaseKitError } from './errors.js';
+export {
+  buildDependencyGraph,
+  type Ecosystem,
+  type GraphPackage,
+  type WorkspaceDependencyGraph,
+} from './dependencyGraph.js';
+export {
+  ENVELOPE_SCHEMA_VERSION,
+  type Envelope,
+  type EnvelopeError,
+  type EnvelopeStatus,
+  type EnvelopeWarning,
+  errorEnvelope,
+  exitCodeForError,
+  successEnvelope,
+  toEnvelopeError,
+} from './envelope.js';
+export { EXIT_CODES, type ExitCode, InputError, ReleaseKitError } from './errors.js';
 export {
   debug,
   error,
@@ -15,15 +40,37 @@ export {
   trace,
   warn,
 } from './logger.js';
+export { extractMarkerRegion, type MarkerData, markerData, wrapMarkerRegion } from './marker.js';
 export {
+  extractNotesRegion,
+  NOTES_MARKER,
+  NOTES_MARKER_END,
+  wrapNotesRegion,
+} from './notesRegion.js';
+export {
+  isPrivatePackageJson,
   matchesPackageTarget,
   shouldMatchPackageTargets,
   shouldProcessPackage,
 } from './packageUtils.js';
-export type {
-  VersionChangelogEntry,
-  VersionOutput,
-  VersionPackageChangelog,
-  VersionPackageUpdate,
+export { isPathWithinRoot } from './paths.js';
+export { type PrerequisiteResolution, resolvePrerequisites } from './prerequisites.js';
+export {
+  extractSelectionRegion,
+  rkGradMarker,
+  rkPreMarker,
+  rkSelMarker,
+  SELECTION_MARKER,
+  SELECTION_MARKER_END,
+  wrapSelectionRegion,
+} from './selectionRegion.js';
+export {
+  deriveReleaseChannel,
+  type ReleaseChannel,
+  type VersionAction,
+  type VersionChangelogEntry,
+  type VersionOutput,
+  type VersionPackageChangelog,
+  type VersionPackageUpdate,
 } from './types.js';
-export { sanitizePackageName } from './utils.js';
+export { assertNotOption, sanitizePackageName } from './utils.js';

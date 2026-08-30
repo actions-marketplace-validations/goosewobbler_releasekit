@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ssh-key: ${{ secrets.ssh_key }}
@@ -33,41 +33,81 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+      - name: Skip if dist already committed on the tag
+        id: guard
+        run: |
+          # Idempotency + loop-break: on a fresh release the tag points at a dist-less commit
+          # (proceed); after a heal it points at the dist commit (no-op) — so re-running on the
+          # force-moved tag can't loop or double-commit. Lets action-dist-heal.yml reuse this job.
+          # The sentinel is the action's entry point (what run-action.mjs loads / the releasekit-release
+          # bin); if the dist layout ever moves, update this path too — otherwise the guard silently
+          # stops no-op'ing and every scheduled heal rebuilds and re-moves the tag.
+          if git cat-file -e "HEAD:packages/release/dist/cli.js" 2>/dev/null; then
+            echo "already_healed=true" >> "$GITHUB_OUTPUT"
+            echo "dist already committed on ${{ inputs.tag }} — skipping (no-op)."
+          else
+            echo "already_healed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup workspace
+        if: steps.guard.outputs.already_healed != 'true'
         uses: ./.github/workflows/actions/setup-workspace
 
       - name: Build packages
+        if: steps.guard.outputs.already_healed != 'true'
         run: pnpm build
 
       - name: Commit dist and tag
+        if: steps.guard.outputs.already_healed != 'true'
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Retry the network/API operations only — a transient push rejection or GitHub API blip
+          # shouldn't strand a dist-less tag while the job is otherwise healthy. Local git ops and
+          # `pnpm build` are deliberately not retried: those fail deterministically and should surface.
+          retry() {
+            local -r what="$*"
+            local n=1
+            until "$@"; do
+              if [ "$n" -ge 3 ]; then
+                echo "::error::failed after 3 attempts: ${what}"
+                return 1
+              fi
+              echo "attempt ${n}/3 failed: ${what} — retrying in $((n * 5))s"
+              sleep "$((n * 5))"
+              n=$((n + 1))
+            done
+          }
+
           git add -f packages/release/dist/
           git commit --no-verify -m "chore: build action dist for ${RELEASE_TAG} [skip ci]"
 
-          # Extract semver from tag: releasekit-release-v1.2.3 -> 1.2.3
-          VERSION="${RELEASE_TAG#releasekit-release-v}"
+          # Extract semver from the sync-mode shared tag, e.g. `v1.2.3` -> `1.2.3`.
+          VERSION="${RELEASE_TAG#v}"
           MAJOR="${VERSION%%.*}"
 
-          # Immutable patch tag — skip if it already exists (idempotent re-runs)
-          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
-            echo "Tag v${VERSION} already exists, skipping"
+          # The release tag itself is already `v${VERSION}` in sync mode, so the version tag
+          # exists. Just ensure the GitHub Release exists (idempotent for re-runs).
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo "Release v${VERSION} already exists, skipping"
           else
-            git tag "v${VERSION}"
-            git push origin "v${VERSION}"
             if [[ "${VERSION}" != *"-"* ]]; then
-              gh release create "v${VERSION}" --title "v${VERSION}" --generate-notes
+              retry gh release create "v${VERSION}" --title "v${VERSION}" --generate-notes
             else
-              gh release create "v${VERSION}" --title "v${VERSION}" --generate-notes --prerelease
+              retry gh release create "v${VERSION}" --title "v${VERSION}" --generate-notes --prerelease
             fi
           fi
+
+          # Force-move the exact version tag to the dist commit so consumers
+          # pinning `uses: goosewobbler/releasekit@v1.2.3` get the built dist.
+          git tag -f "v${VERSION}"
+          retry git push origin -f "v${VERSION}"
 
           # Moving major alias — only update for stable releases
           if [[ "${VERSION}" != *"-"* ]]; then
             git tag -f "v${MAJOR}"
-            git push origin -f "v${MAJOR}"
+            retry git push origin -f "v${MAJOR}"
           else
             echo "Prerelease ${VERSION} — skipping major alias update"
           fi

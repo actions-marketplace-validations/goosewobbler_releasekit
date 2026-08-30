@@ -37,6 +37,11 @@ let quietMode = false;
 
 export function setLogLevel(level: LogLevel): void {
   currentLevel = level;
+  if (level === 'debug') {
+    process.env.DEBUG = 'true';
+  } else {
+    delete process.env.DEBUG;
+  }
 }
 
 export function setQuietMode(quiet: boolean): void {
@@ -60,6 +65,8 @@ function shouldLog(level: LogLevel): boolean {
   // JSON mode no longer suppresses stderr logging — JSON output goes to stdout,
   // logs go to stderr, so they don't interfere with each other.
   if (quietMode && level !== 'error') return false;
+  // Debug messages are shown when DEBUG env var is set or log level allows it
+  if (level === 'debug' && (process.env.DEBUG === 'true' || process.env.DEBUG === '1')) return true;
   return LOG_LEVELS[level] <= LOG_LEVELS[currentLevel];
 }
 

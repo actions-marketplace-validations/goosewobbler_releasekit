@@ -6,9 +6,9 @@ import * as commitParser from '../../../src/changelog/commitParser.js';
 import * as calculator from '../../../src/core/versionCalculator.js';
 import type { PackagesWithRoot } from '../../../src/core/versionEngine.js';
 import * as strategies from '../../../src/core/versionStrategies.js';
-import * as commandExecutor from '../../../src/git/commandExecutor.js';
 import * as gitCommands from '../../../src/git/commands.js';
 import * as gitTags from '../../../src/git/tagsAndBranches.js';
+import * as tagVerification from '../../../src/git/tagVerification.js';
 import * as packageManagement from '../../../src/package/packageManagement.js';
 import { PackageProcessor } from '../../../src/package/packageProcessor.js';
 import type { Config } from '../../../src/types.js';
@@ -19,7 +19,7 @@ import * as logging from '../../../src/utils/logging.js';
 // Mock dependencies
 vi.mock('../../../src/git/commands.js');
 vi.mock('../../../src/git/tagsAndBranches.js');
-vi.mock('../../../src/git/commandExecutor.js');
+vi.mock('../../../src/git/tagVerification.js');
 vi.mock('../../../src/utils/logging.js');
 vi.mock('../../../src/core/versionCalculator.js');
 vi.mock('../../../src/package/packageManagement.js');
@@ -34,6 +34,17 @@ vi.mock('../../../src/utils/formatting.js', () => ({
     ),
   formatCommitMessage: vi.fn().mockImplementation((template, version, packageName) => {
     return template.replace(/\$\{version\}/g, version).replace(/\$\{packageName\}/g, packageName || '');
+  }),
+  deriveBaselineTagPrefix: vi.fn().mockImplementation((template, formattedPrefix, packageName) => {
+    if (!template) return undefined;
+    return template
+      .split('${' + 'version}')[0]
+      .replace(/\$\{prefix\}/g, formattedPrefix)
+      .replace(/\$\{packageName\}/g, packageName ?? '');
+  }),
+  displayTag: vi.fn().mockImplementation((tag, baselineTagPrefix, formattedPrefix) => {
+    if (!baselineTagPrefix || !tag.startsWith(baselineTagPrefix)) return tag;
+    return `${formattedPrefix}${tag.slice(baselineTagPrefix.length)}`;
   }),
 }));
 vi.mock('../../../src/package/packageProcessor.js');
@@ -76,7 +87,6 @@ describe('Version Strategies', () => {
     preset: 'conventional-commits',
     versionPrefix: 'v',
     tagTemplate: '${' + 'prefix}${' + 'version}',
-    baseBranch: 'main',
   };
 
   beforeEach(() => {
@@ -92,10 +102,26 @@ describe('Version Strategies', () => {
     vi.mocked(formatting.formatTag, { partial: true }).mockReturnValue('v1.1.0');
     // Default mock: single-package result used by most tests. Sync tests override this.
     vi.mocked(formatting.formatCommitMessage, { partial: true }).mockReturnValue('chore: release package-a v1.1.0');
-    vi.mocked(commitParser.extractChangelogEntriesFromCommits, { partial: true }).mockReturnValue([
+    vi.mocked(formatting.deriveBaselineTagPrefix, { partial: true }).mockImplementation(
+      (template, formattedPrefix, packageName) => {
+        if (!template) return undefined;
+        return template
+          .split('${' + 'version}')[0]
+          .replace(/\$\{prefix\}/g, formattedPrefix)
+          .replace(/\$\{packageName\}/g, packageName ?? '');
+      },
+    );
+    vi.mocked(formatting.displayTag, { partial: true }).mockImplementation(
+      (tag, baselineTagPrefix, formattedPrefix) => {
+        if (!baselineTagPrefix || !tag.startsWith(baselineTagPrefix)) return tag;
+        return `${formattedPrefix}${tag.slice(baselineTagPrefix.length)}`;
+      },
+    );
+    vi.mocked(commitParser.extractChangelogEntriesFromCommits, { partial: true }).mockResolvedValue([
       { type: 'added', description: 'New feature' },
     ]);
-    vi.mocked(commandExecutor.execSync, { partial: true }).mockReturnValue(Buffer.from(''));
+    // Default: the baseline tag verifies as reachable, so the range is bounded `<tag>..HEAD`.
+    vi.mocked(tagVerification.verifyTag, { partial: true }).mockResolvedValue({ exists: true, reachable: true });
 
     // Setup PackageProcessor mock
     vi.mocked(PackageProcessor.prototype.processPackages, { partial: true }).mockResolvedValue({
@@ -183,7 +209,7 @@ describe('Version Strategies', () => {
       );
 
       // Check root package update
-      expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(rootPackagePath, '1.1.0', undefined);
+      expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(rootPackagePath, '1.1.0', undefined, true);
 
       // Check workspace packages update
       expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(packageAPath, '1.1.0', undefined);
@@ -200,6 +226,60 @@ describe('Version Strategies', () => {
       // Check tag and commit message tracked for JSON output (git ops now handled by publish)
       expect(jsonOutput.addTag).toHaveBeenCalledWith('v1.1.0');
       expect(jsonOutput.setCommitMessage).toHaveBeenCalledWith('chore: release package-a, package-b v1.1.0');
+      // Sync mode with shared tag: setPackageUpdateTag must NOT be called (batch push mode)
+      expect(jsonOutput.setPackageUpdateTag).not.toHaveBeenCalled();
+    });
+
+    it('should still version Cargo.toml and not abandon it when npm handling is disabled on a hybrid repo', async () => {
+      // Hybrid sync monorepo (existsSync mock returns true for every package.json AND Cargo.toml) with
+      // npm versioning opted out: package.json writes are skipped, but Cargo.toml must still be versioned
+      // and the run must not early-return as "no packages updated" (which would abandon the written files).
+      const config: Partial<Config> = { ...defaultConfig, sync: true, npm: { enabled: false } };
+      const syncStrategy = strategies.createSyncStrategy(config as Config);
+
+      await syncStrategy(mockPackages);
+
+      // package.json manifests (root 4-arg, members 3-arg) are skipped...
+      expect(packageManagement.updatePackageVersion).not.toHaveBeenCalledWith(
+        packageAPath,
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(packageManagement.updatePackageVersion).not.toHaveBeenCalledWith(
+        rootPackagePath,
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+      // ...but Cargo.toml is still versioned (root + members); updateCargoFiles passes dryRun=false.
+      expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(
+        '/test/workspace/packages/a/Cargo.toml',
+        '1.1.0',
+        false,
+      );
+      expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith('/test/workspace/Cargo.toml', '1.1.0', false);
+      // ...and the run proceeds to tag rather than early-returning.
+      expect(jsonOutput.addTag).toHaveBeenCalledWith('v1.1.0');
+    });
+
+    it('should not version a single-package repo Cargo.toml twice when npm is disabled', async () => {
+      // Single-package repo where the package IS the root (packages.root === packages[0].dir). With
+      // npm disabled, processedPaths must still record the root path so the per-package loop skips it,
+      // or updateCargoFiles runs for the same dir twice — writing Cargo.toml twice.
+      const singlePkg = {
+        root: '/test/workspace',
+        packages: [{ dir: '/test/workspace', packageJson: { name: 'root-pkg', version: '1.0.0' } }],
+      };
+      const config: Partial<Config> = { ...defaultConfig, sync: true, npm: { enabled: false } };
+      await strategies.createSyncStrategy(config as Config)(singlePkg as typeof mockPackages);
+
+      const cargoCalls = vi
+        .mocked(packageManagement.updatePackageVersion)
+        .mock.calls.filter((c) => c[0] === '/test/workspace/Cargo.toml');
+      expect(cargoCalls).toHaveLength(1);
+      // The run must not early-return as "nothing updated" — 'root' is tracked for the cargo-only
+      // update, so the shared tag is still created and the written Cargo.toml is committed.
+      expect(jsonOutput.addTag).toHaveBeenCalledWith('v1.1.0');
     });
 
     it('should use mainPackage for version calculation when specified', async () => {
@@ -226,7 +306,7 @@ describe('Version Strategies', () => {
       );
 
       // Still updates all packages
-      expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(rootPackagePath, '1.1.0', undefined);
+      expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(rootPackagePath, '1.1.0', undefined, true);
       expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(packageAPath, '1.1.0', undefined);
       expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(packageBPath, '1.1.0', undefined);
     });
@@ -347,6 +427,105 @@ describe('Version Strategies', () => {
       expect(logging.log).toHaveBeenCalledWith('No version change needed', 'info');
     });
 
+    it('should emit a baseline tag and use its prefix for getLatestTag when baselineTagTemplate is set', async () => {
+      // Override the default formatTag mock so it actually applies the template — otherwise
+      // both the consumer tag and the baseline tag would render identically.
+      vi.mocked(formatting.formatTag).mockImplementation((version, prefix, packageName, template) => {
+        if (template) {
+          return template
+            .replace(/\$\{version\}/g, version)
+            .replace(/\$\{prefix\}/g, prefix)
+            .replace(/\$\{packageName\}/g, packageName || '');
+        }
+        return packageName ? `${packageName}@${prefix}${version}` : `${prefix}${version}`;
+      });
+
+      const config: Partial<Config> = {
+        ...defaultConfig,
+        sync: true,
+        baselineTagTemplate: 'release/${' + 'prefix}${' + 'version}',
+      };
+
+      const syncStrategy = strategies.createSyncStrategy(config as Config);
+
+      await syncStrategy(mockPackages);
+
+      // getLatestTag should be invoked with the baseline prefix so the semver scan filters
+      // to baseline tags (which stay on the source branch's history).
+      expect(git.getLatestTag).toHaveBeenCalledWith('release/v');
+
+      // Consumer tag goes to addTag; baseline tag goes to addBaselineTag — separate fields
+      // on VersionOutput so the publish pipeline can push both but skip the GitHub Release
+      // for the baseline.
+      expect(jsonOutput.addTag).toHaveBeenCalledWith('v1.1.0');
+      expect(jsonOutput.addBaselineTag).toHaveBeenCalledWith('release/v1.1.0');
+      expect(jsonOutput.addTag).not.toHaveBeenCalledWith('release/v1.1.0');
+    });
+
+    it('should not emit a baseline tag or alter getLatestTag when baselineTagTemplate is unset', async () => {
+      const config: Partial<Config> = {
+        ...defaultConfig,
+        sync: true,
+      };
+
+      const syncStrategy = strategies.createSyncStrategy(config as Config);
+
+      await syncStrategy(mockPackages);
+
+      // No prefix passed — falls back to the default semver-tag scan.
+      expect(git.getLatestTag).toHaveBeenCalledWith(undefined);
+      expect(jsonOutput.addTag).toHaveBeenCalledWith('v1.1.0');
+      expect(jsonOutput.addBaselineTag).not.toHaveBeenCalled();
+    });
+
+    it('should display previousVersion in consumer-facing form when baselineTagTemplate is set', async () => {
+      // The preview/changelog should show `v0.21.0 → 0.22.0`, not the internal baseline form
+      // `release/v0.21.0 → 0.22.0`. previousVersion needs the prefix swapped from the baseline
+      // family back to the consumer family.
+      vi.mocked(git.getLatestTag).mockResolvedValue('release/v0.21.0');
+
+      const config: Partial<Config> = {
+        ...defaultConfig,
+        sync: true,
+        baselineTagTemplate: 'release/${' + 'prefix}${' + 'version}',
+      };
+
+      const syncStrategy = strategies.createSyncStrategy(config as Config);
+
+      await syncStrategy(mockPackages);
+
+      expect(jsonOutput.addChangelogData).toHaveBeenCalledWith(
+        expect.objectContaining({
+          previousVersion: 'v0.21.0',
+        }),
+      );
+    });
+
+    it('should skip the package-specific tag override when baselineTagTemplate is set', async () => {
+      // Without the guard, getLatestTagForPackage's return value would clobber the baseline
+      // — which would re-introduce the unreachable-tag regression baselineTagTemplate exists
+      // to fix when packageSpecificTags is enabled alongside it.
+      vi.mocked(git.getLatestTagForPackage).mockResolvedValue('v0.99.0');
+      const config: Partial<Config> = {
+        ...defaultConfig,
+        sync: true,
+        packageSpecificTags: true,
+        baselineTagTemplate: 'release/${' + 'prefix}${' + 'version}',
+      };
+
+      const syncStrategy = strategies.createSyncStrategy(config as Config);
+
+      await syncStrategy(mockPackages);
+
+      // getLatestTagForPackage must not be called when baselineTagTemplate is set.
+      expect(git.getLatestTagForPackage).not.toHaveBeenCalled();
+      // calculateVersion must use the baseline tag, not the package-specific override.
+      expect(calculator.calculateVersion).toHaveBeenCalledWith(
+        config as Config,
+        expect.objectContaining({ latestTag: 'v1.0.0' }),
+      );
+    });
+
     it('should respect skip configuration', async () => {
       const config: Partial<Config> = {
         ...defaultConfig,
@@ -360,7 +539,7 @@ describe('Version Strategies', () => {
       await syncStrategy(mockPackages);
 
       // Verify package-b was skipped
-      expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(rootPackagePath, '1.1.0', undefined);
+      expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(rootPackagePath, '1.1.0', undefined, true);
       expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(packageAPath, '1.1.0', undefined);
       expect(packageManagement.updatePackageVersion).not.toHaveBeenCalledWith(packageBPath, '1.1.0', undefined);
     });
@@ -405,6 +584,29 @@ describe('Version Strategies', () => {
         );
       });
 
+      it('should warn loudly and omit previousVersion when the baseline tag is unverifiable', async () => {
+        // The baseline tag fails verification (e.g. shallow clone / unpushed tag).
+        vi.mocked(tagVerification.verifyTag, { partial: true }).mockResolvedValue({
+          exists: true,
+          reachable: false,
+          error: 'exists but is not an ancestor of HEAD',
+        });
+
+        const config: Partial<Config> = { ...defaultConfig, sync: true };
+        const syncStrategy = strategies.createSyncStrategy(config as Config);
+
+        await syncStrategy(mockPackages);
+
+        // Range falls back to all-history...
+        expect(commitParser.extractChangelogEntriesFromCommits).toHaveBeenCalledWith('/test/workspace', 'HEAD');
+        // ...the fallback is surfaced as a warning, not a silent debug line...
+        expect(logging.log).toHaveBeenCalledWith(expect.stringContaining('could not be verified from HEAD'), 'warning');
+        // ...and previousVersion is omitted so the changelog doesn't claim a baseline it never diffed against.
+        expect(jsonOutput.addChangelogData).toHaveBeenCalledWith(
+          expect.objectContaining({ previousVersion: null, revisionRange: 'HEAD' }),
+        );
+      });
+
       it('should use mainPackage name when specified', async () => {
         const config: Partial<Config> = {
           ...defaultConfig,
@@ -445,6 +647,42 @@ describe('Version Strategies', () => {
         );
       });
 
+      it('should use baseRef for revision range when config.baseRef is set', async () => {
+        const config: Partial<Config> = {
+          ...defaultConfig,
+          sync: true,
+          baseRef: 'deadbeef1234',
+        };
+
+        const syncStrategy = strategies.createSyncStrategy(config as Config);
+        await syncStrategy(mockPackages);
+
+        expect(commitParser.extractChangelogEntriesFromCommits).toHaveBeenCalledWith(
+          '/test/workspace',
+          'deadbeef1234..HEAD',
+        );
+      });
+
+      it('should fall back to HEAD when baseRef cannot be resolved by git', async () => {
+        // The baseRef fails verification (bad object).
+        vi.mocked(tagVerification.verifyTag, { partial: true }).mockResolvedValue({
+          exists: false,
+          reachable: false,
+          error: "Ref 'nonexistent-sha' not found in repository",
+        });
+
+        const config: Partial<Config> = {
+          ...defaultConfig,
+          sync: true,
+          baseRef: 'nonexistent-sha',
+        };
+
+        const syncStrategy = strategies.createSyncStrategy(config as Config);
+        await syncStrategy(mockPackages);
+
+        expect(commitParser.extractChangelogEntriesFromCommits).toHaveBeenCalledWith('/test/workspace', 'HEAD');
+      });
+
       it('should create one tag per workspace package when packageSpecificTags is true', async () => {
         vi.mocked(formatting.formatTag, { partial: true }).mockImplementation((_version, _prefix, packageName) =>
           packageName ? `${packageName}-v1.1.0` : 'v1.1.0',
@@ -463,6 +701,8 @@ describe('Version Strategies', () => {
         expect(jsonOutput.addTag).toHaveBeenCalledWith('package-a-v1.1.0');
         expect(jsonOutput.addTag).toHaveBeenCalledWith('package-b-v1.1.0');
         expect(jsonOutput.addTag).toHaveBeenCalledTimes(2);
+        expect(jsonOutput.setPackageUpdateTag).toHaveBeenCalledWith('package-a', 'package-a-v1.1.0');
+        expect(jsonOutput.setPackageUpdateTag).toHaveBeenCalledWith('package-b', 'package-b-v1.1.0');
       });
 
       it('should emit one changelog entry per workspace package when packageSpecificTags is true', async () => {
@@ -520,7 +760,7 @@ describe('Version Strategies', () => {
       });
 
       it('should create fallback changelog entry when no commits found', async () => {
-        vi.mocked(commitParser.extractChangelogEntriesFromCommits, { partial: true }).mockReturnValue([]);
+        vi.mocked(commitParser.extractChangelogEntriesFromCommits, { partial: true }).mockResolvedValue([]);
 
         const config: Partial<Config> = {
           ...defaultConfig,
@@ -576,7 +816,29 @@ describe('Version Strategies', () => {
 
       // Check tag and commit message tracked for JSON output (git ops now handled by publish)
       expect(jsonOutput.addTag).toHaveBeenCalledWith('v1.1.0');
+      expect(jsonOutput.setPackageUpdateTag).toHaveBeenCalledWith('package-a', 'v1.1.0');
       expect(jsonOutput.setCommitMessage).toHaveBeenCalledWith('chore: release package-a v1.1.0');
+    });
+
+    it('should warn and omit previousVersion when the baseline tag is unverifiable', async () => {
+      // The baseline tag fails verification (shallow clone / unpushed tag).
+      vi.mocked(tagVerification.verifyTag, { partial: true }).mockResolvedValue({
+        exists: true,
+        reachable: false,
+        error: 'exists but is not an ancestor of HEAD',
+      });
+
+      const config: Partial<Config> = { ...defaultConfig, mainPackage: 'package-a' };
+      const singleStrategy = strategies.createSingleStrategy(config as Config);
+
+      await singleStrategy(mockPackages);
+
+      // Loud warning, all-history range, and previousVersion omitted so the changelog doesn't claim
+      // a baseline it never diffed against — same guarantee as createSyncStrategy.
+      expect(logging.log).toHaveBeenCalledWith(expect.stringContaining('could not be verified from HEAD'), 'warning');
+      expect(jsonOutput.addChangelogData).toHaveBeenCalledWith(
+        expect.objectContaining({ previousVersion: null, revisionRange: 'HEAD' }),
+      );
     });
 
     it('should use packageName in commit message template', async () => {
@@ -905,7 +1167,7 @@ describe('Version Strategies', () => {
       await asyncStrategy(mockPackages);
 
       // Verify that packages are processed (no setTargets call since targeting is at discovery time)
-      expect(PackageProcessor.prototype.processPackages).toHaveBeenCalledWith(mockPackages.packages);
+      expect(PackageProcessor.prototype.processPackages).toHaveBeenCalledWith(mockPackages.packages, '/test/workspace');
 
       // Check logging
       expect(logging.log).toHaveBeenCalledWith('Processing 2 packages', 'info');
@@ -933,7 +1195,10 @@ describe('Version Strategies', () => {
         },
       ];
 
-      expect(PackageProcessor.prototype.processPackages).toHaveBeenCalledWith(expectedFilteredPackages);
+      expect(PackageProcessor.prototype.processPackages).toHaveBeenCalledWith(
+        expectedFilteredPackages,
+        '/test/workspace',
+      );
 
       // Check filtering log messages
       expect(logging.log).toHaveBeenCalledWith('Runtime targets filter: 2 → 1 packages (package-b)', 'info');
@@ -989,7 +1254,10 @@ describe('Version Strategies', () => {
         },
       ];
 
-      expect(PackageProcessor.prototype.processPackages).toHaveBeenCalledWith(expectedFilteredPackages);
+      expect(PackageProcessor.prototype.processPackages).toHaveBeenCalledWith(
+        expectedFilteredPackages,
+        '/test/workspace',
+      );
 
       // Check filtering log messages
       expect(logging.log).toHaveBeenCalledWith('Runtime targets filter: 3 → 2 packages (@scope/*)', 'info');
@@ -1009,7 +1277,7 @@ describe('Version Strategies', () => {
       await asyncStrategy(mockPackages);
 
       // Verify that all packages are processed (no filtering)
-      expect(PackageProcessor.prototype.processPackages).toHaveBeenCalledWith(mockPackages.packages);
+      expect(PackageProcessor.prototype.processPackages).toHaveBeenCalledWith(mockPackages.packages, '/test/workspace');
 
       // Should not show runtime filter message
       expect(logging.log).toHaveBeenCalledWith('Processing 2 packages', 'info');
@@ -1028,7 +1296,7 @@ describe('Version Strategies', () => {
       await asyncStrategy(mockPackages);
 
       // Verify packages are processed
-      expect(PackageProcessor.prototype.processPackages).toHaveBeenCalledWith(mockPackages.packages);
+      expect(PackageProcessor.prototype.processPackages).toHaveBeenCalledWith(mockPackages.packages, '/test/workspace');
       expect(logging.log).toHaveBeenCalledWith('Processing 2 packages', 'info');
     });
 
@@ -1118,6 +1386,32 @@ describe('Version Strategies', () => {
       expect(strategyMap).toHaveProperty('sync');
       expect(strategyMap).toHaveProperty('single');
       expect(strategyMap).toHaveProperty('async');
+      expect(strategyMap).toHaveProperty('group');
+    });
+  });
+
+  describe('createStrategy group routing', () => {
+    it('should route explicit version.groups through the group strategy', () => {
+      const config: Partial<Config> = {
+        ...defaultConfig,
+        sync: false,
+        groups: { native: { packages: ['@wdio/native-*'], sync: 'linked' } },
+      };
+      // The group strategy is async (takes optional targets); just assert it's defined and callable.
+      const strategy = strategies.createStrategy(config as Config);
+      expect(strategy).toBeDefined();
+    });
+
+    it('should keep sync:true on the established sync strategy for back-compat', async () => {
+      const config: Partial<Config> = {
+        ...defaultConfig,
+        sync: true,
+      };
+      const strategy = strategies.createStrategy(config as Config);
+      // The sync strategy updates the root package.json with isRoot=true — a fingerprint the
+      // group strategy never produces — so this confirms sync:true still uses createSyncStrategy.
+      await strategy(mockPackages);
+      expect(packageManagement.updatePackageVersion).toHaveBeenCalledWith(rootPackagePath, '1.1.0', undefined, true);
     });
   });
 });

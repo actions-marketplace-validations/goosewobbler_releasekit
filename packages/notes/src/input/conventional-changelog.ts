@@ -1,3 +1,4 @@
+/* eslint-disable local/no-bare-issue-refs -- the #NNN here are regex format examples, not issue citations */
 import * as fs from 'node:fs';
 import type { ChangelogEntry, ChangelogInput, PackageChangelog } from '../core/types.js';
 import { InputParseError } from '../errors/index.js';
@@ -83,6 +84,9 @@ function parseEntry(line: string, sectionType: ChangelogEntry['type']): Changelo
     rawText = scopeMatch[2] ?? rawText;
   }
 
+  // No PR detection here: this adapter parses existing/external CHANGELOG.md text, where a trailing
+  // `(#N)` is ambiguous (it could be an issue ref) and there's no commit signal to confirm. Only the
+  // commit-based parsers (commitParser.ts, git-log.ts) infer prNumber, from a real squash-merge subject.
   const { description, issueIds } = extractIssueIds(rawText);
 
   return {

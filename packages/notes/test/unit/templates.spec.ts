@@ -11,6 +11,7 @@ const sampleContext: TemplateContext = {
   packageName: 'test-pkg',
   version: '1.0.0',
   previousVersion: null,
+  isFirstRelease: true,
   date: '2026-02-21',
   repoUrl: 'https://github.com/test/test-pkg',
   entries: [
@@ -37,6 +38,12 @@ describe('Liquid Engine', () => {
     const result = renderLiquid(template, sampleContext);
     expect(result).toBe('No previous');
   });
+
+  it('should branch on isFirstRelease', () => {
+    const template = '{% if isFirstRelease %}First!{% else %}Update{% endif %}';
+    expect(renderLiquid(template, sampleContext)).toBe('First!');
+    expect(renderLiquid(template, { ...sampleContext, isFirstRelease: false })).toBe('Update');
+  });
 });
 
 describe('Handlebars Engine', () => {
@@ -50,6 +57,12 @@ describe('Handlebars Engine', () => {
     const template = '{{#each entries}}- {{description}}{{/each}}';
     const result = renderHandlebars(template, sampleContext);
     expect(result).toBe('- New feature- Bug fix');
+  });
+
+  it('should branch on isFirstRelease', () => {
+    const template = '{{#if isFirstRelease}}First!{{else}}Update{{/if}}';
+    expect(renderHandlebars(template, sampleContext)).toBe('First!');
+    expect(renderHandlebars(template, { ...sampleContext, isFirstRelease: false })).toBe('Update');
   });
 
   it('should uppercase the first letter of a string with the capitalize helper', () => {
@@ -127,6 +140,20 @@ describe('release.liquid template', () => {
 
     const result = renderLiquid(template, ctx);
     expect(result).toContain('**Full Changelog**: https://github.com/test/test-pkg/compare/v0.9.0...v1.0.0');
+  });
+
+  it('should lead with a first-release line when isFirstRelease is true', () => {
+    const first: DocumentContext = {
+      project: { name: 'test-pkg' },
+      versions: [{ ...sampleContext, isFirstRelease: true }],
+    };
+    expect(renderLiquid(template, first)).toContain('_First release of `test-pkg`._');
+
+    const subsequent: DocumentContext = {
+      project: { name: 'test-pkg' },
+      versions: [{ ...sampleContext, isFirstRelease: false }],
+    };
+    expect(renderLiquid(template, subsequent)).not.toContain('First release of');
   });
 
   it('should skip empty categories', () => {

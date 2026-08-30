@@ -1,5 +1,8 @@
 # @releasekit/notes
 
+> [!WARNING]
+> 🚧 **Pre-1.0.0** — ReleaseKit is evolving fast and **💥 breaking changes are common**; it's **not production-ready** until `v1.0.0`. Pin exact versions. See the [main README](../../README.md) for details.
+
 [![@releasekit/notes](https://img.shields.io/badge/@releasekit-notes-9feaf9?labelColor=1a1a1a&style=plastic)](https://www.npmjs.com/package/@releasekit/notes)
 [![Version](https://img.shields.io/npm/v/@releasekit/notes?color=28a745&labelColor=1a1a1a)](https://www.npmjs.com/package/@releasekit/notes)
 [![Downloads](https://img.shields.io/npm/dw/@releasekit/notes?color=6f42c1&labelColor=1a1a1a)](https://www.npmjs.com/package/@releasekit/notes)
@@ -14,14 +17,20 @@ Generates CHANGELOG.md and release notes from `@releasekit/version` output, with
 - 🤖 **LLM enhancement** (optional) — enhance descriptions, summarize, categorize, or generate prose release notes
 - 🎨 **Flexible templating** — Liquid, Handlebars, or EJS; single-file or composable layout
 - 📦 **Monorepo support** — root aggregation, per-package changelogs, or both
-- 🔀 **Two outputs** — `CHANGELOG.md` and `RELEASE_NOTES.md` are configured independently
+- 🔀 **Changelog + release notes** — a cumulative `CHANGELOG.md` and per-release notes (GitHub release body, or opt-in per-version files), configured independently
 - 🔍 **Dry-run mode** — preview without writing files
 
 ## Installation
 
+**npm:**
+
 ```bash
 npm install -g @releasekit/notes
-# or
+```
+
+**pnpm:**
+
+```bash
 pnpm add -g @releasekit/notes
 ```
 
@@ -56,8 +65,7 @@ releasekit-notes --input version-data.json \
 | `--changelog-mode <mode>` | Changelog location: `root`, `packages`, `both` | `root` |
 | `--changelog-file <name>` | Changelog file name override | `CHANGELOG.md` |
 | `--no-changelog` | Disable changelog generation | — |
-| `--release-notes-mode <mode>` | Enable release notes file output: `root`, `packages`, `both` | — |
-| `--release-notes-file <name>` | Release notes file name override | `RELEASE_NOTES.md` |
+| `--release-notes-dir <dir>` | Write per-version release-notes files to this directory | — |
 | `--no-release-notes` | Disable release notes generation | — |
 | `-t, --template <path>` | Template file or directory | built-in |
 | `-e, --engine <engine>` | Template engine: `handlebars`, `liquid`, `ejs` | `liquid` |
@@ -106,7 +114,6 @@ All options live under the `notes` key in `releasekit.config.json`:
       }
     },
     "releaseNotes": {
-      "mode": "root",
       "llm": {
         "provider": "openai",
         "model": "gpt-4o-mini",
@@ -140,7 +147,7 @@ LLM configuration lives under `notes.releaseNotes.llm`:
 |------|-------------|
 | `enhance` | Rewrites each changelog entry description to be clearer |
 | `summarize` | Generates a one-paragraph summary of the release |
-| `categorize` | Groups entries into user-friendly categories (Features, Fixes, …) |
+| `categorize` | Groups entries into semantic categories (default set: Breaking, New, Changed, Fixed, Developer) |
 | `releaseNotes` | Generates full prose release notes (use as GitHub release body) |
 
 ## Templates
@@ -239,6 +246,7 @@ const result = await runPipeline(input, config, false);
 - [LLM providers](./docs/llm-providers.md) — provider setup, auth, tasks, prompt customisation
 
 **Guides**
+- [LLM-enhanced release notes](./docs/llm-release-notes.md) — full guide to LLM tasks, categories, output rendering
 - [Templates](./docs/templates.md) — custom template authoring and context reference
 - [Monorepo](./docs/monorepo.md) — per-package and root output modes
 

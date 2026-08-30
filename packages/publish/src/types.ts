@@ -10,6 +10,7 @@ export interface NpmConfig {
   registry: string;
   copyFiles: string[];
   tag: string;
+  publishOrder: string[];
 }
 
 export interface CargoConfig {
@@ -17,6 +18,11 @@ export interface CargoConfig {
   noVerify: boolean;
   publishOrder: string[];
   clean: boolean;
+}
+
+export interface PubConfig {
+  enabled: boolean;
+  publishOrder: string[];
 }
 
 export interface GitConfig {
@@ -37,6 +43,8 @@ export interface GitHubReleaseConfig {
   body: 'auto' | 'releaseNotes' | 'changelog' | 'generated' | 'none';
   /** Template for the release title when a package name is resolved. Variables: ${packageName}, ${version}. */
   titleTemplate: string;
+  /** Package names to exclude from GitHub release creation. Tags and npm publish are unaffected. */
+  skipPackages: string[];
 }
 
 export interface VerifyRegistryConfig {
@@ -49,11 +57,13 @@ export interface VerifyRegistryConfig {
 export interface VerifyConfig {
   npm: VerifyRegistryConfig;
   cargo: VerifyRegistryConfig;
+  pub: VerifyRegistryConfig;
 }
 
 export interface PublishConfig {
   npm: NpmConfig;
   cargo: CargoConfig;
+  pub: PubConfig;
   git: GitConfig;
   githubRelease: GitHubReleaseConfig;
   verify: VerifyConfig;
@@ -62,7 +72,7 @@ export interface PublishConfig {
 export interface PublishCliOptions {
   input?: string;
   config?: string;
-  registry: 'npm' | 'cargo' | 'all';
+  registry: 'npm' | 'cargo' | 'pub' | 'all';
   npmAuth: 'auto' | 'oidc' | 'token';
   dryRun: boolean;
   skipGit: boolean;
@@ -81,17 +91,24 @@ export interface PublishCliOptions {
 export interface PublishResult {
   packageName: string;
   version: string;
-  registry: 'npm' | 'cargo';
+  registry: 'npm' | 'cargo' | 'pub';
   success: boolean;
   skipped: boolean;
   reason?: string;
   alreadyPublished?: boolean;
+  /**
+   * Number of publish attempts made for this package (1 = succeeded first try,
+   * >1 = transient errors were retried). Recorded so the failure report can
+   * surface retry activity. Absent for packages that were never attempted
+   * (e.g. private/already-published skips).
+   */
+  attempts?: number;
 }
 
 export interface VerificationResult {
   packageName: string;
   version: string;
-  registry: 'npm' | 'cargo';
+  registry: 'npm' | 'cargo' | 'pub';
   verified: boolean;
   attempts: number;
 }
@@ -116,6 +133,7 @@ export interface PublishOutput {
   git: GitResult;
   npm: PublishResult[];
   cargo: PublishResult[];
+  pub: PublishResult[];
   verification: VerificationResult[];
   githubReleases: GitHubReleaseResult[];
   publishSucceeded: boolean;
@@ -144,12 +162,17 @@ export function getDefaultConfig(): PublishConfig {
       registry: 'https://registry.npmjs.org',
       copyFiles: ['LICENSE'],
       tag: 'latest',
+      publishOrder: [],
     },
     cargo: {
       enabled: false,
       noVerify: false,
       publishOrder: [],
       clean: false,
+    },
+    pub: {
+      enabled: false,
+      publishOrder: [],
     },
     git: {
       push: true,
@@ -167,6 +190,7 @@ export function getDefaultConfig(): PublishConfig {
       body: 'auto',
       /* biome-ignore lint/suspicious/noTemplateCurlyInString: default template value */
       titleTemplate: '${packageName}: ${version}',
+      skipPackages: [],
     },
     verify: {
       npm: {
@@ -176,6 +200,12 @@ export function getDefaultConfig(): PublishConfig {
         backoffMultiplier: 2,
       },
       cargo: {
+        enabled: true,
+        maxAttempts: 10,
+        initialDelay: 30000,
+        backoffMultiplier: 2,
+      },
+      pub: {
         enabled: true,
         maxAttempts: 10,
         initialDelay: 30000,
@@ -199,12 +229,17 @@ export function toPublishConfig(config: BasePublishConfig | undefined): PublishC
       registry: config.npm?.registry ?? defaults.npm.registry,
       copyFiles: config.npm?.copyFiles ?? defaults.npm.copyFiles,
       tag: config.npm?.tag ?? defaults.npm.tag,
+      publishOrder: config.npm?.publishOrder ?? defaults.npm.publishOrder,
     },
     cargo: {
       enabled: config.cargo?.enabled ?? defaults.cargo.enabled,
       noVerify: config.cargo?.noVerify ?? defaults.cargo.noVerify,
       publishOrder: config.cargo?.publishOrder ?? defaults.cargo.publishOrder,
       clean: config.cargo?.clean ?? defaults.cargo.clean,
+    },
+    pub: {
+      enabled: config.pub?.enabled ?? defaults.pub.enabled,
+      publishOrder: config.pub?.publishOrder ?? defaults.pub.publishOrder,
     },
     git: config.git
       ? {
@@ -223,6 +258,7 @@ export function toPublishConfig(config: BasePublishConfig | undefined): PublishC
       prerelease: config.githubRelease?.prerelease ?? defaults.githubRelease.prerelease,
       body: config.githubRelease?.body ?? defaults.githubRelease.body,
       titleTemplate: config.githubRelease?.titleTemplate ?? defaults.githubRelease.titleTemplate,
+      skipPackages: config.githubRelease?.skipPackages ?? defaults.githubRelease.skipPackages,
     },
     verify: {
       npm: {
@@ -236,6 +272,12 @@ export function toPublishConfig(config: BasePublishConfig | undefined): PublishC
         maxAttempts: config.verify?.cargo?.maxAttempts ?? defaults.verify.cargo.maxAttempts,
         initialDelay: config.verify?.cargo?.initialDelay ?? defaults.verify.cargo.initialDelay,
         backoffMultiplier: config.verify?.cargo?.backoffMultiplier ?? defaults.verify.cargo.backoffMultiplier,
+      },
+      pub: {
+        enabled: config.verify?.pub?.enabled ?? defaults.verify.pub.enabled,
+        maxAttempts: config.verify?.pub?.maxAttempts ?? defaults.verify.pub.maxAttempts,
+        initialDelay: config.verify?.pub?.initialDelay ?? defaults.verify.pub.initialDelay,
+        backoffMultiplier: config.verify?.pub?.backoffMultiplier ?? defaults.verify.pub.backoffMultiplier,
       },
     },
   };

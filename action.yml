@@ -8,7 +8,7 @@ branding:
 
 inputs:
   mode:
-    description: Action mode (release, preview, or gate)
+    description: Action mode (release, preview, gate, standing-pr-update, standing-pr-publish, backfill, or refresh-after-release)
     required: false
     default: preview
   config:
@@ -34,13 +34,21 @@ inputs:
     description: Suppress non-error output
     required: false
     default: "false"
+  skip-checkout:
+    description: "Skip repository checkout (assume repo is already checked out). WARNING: Ensure repository has full git history (fetch-depth: 0) for proper version-bumping logic. Shallow clones may cause incorrect version bumps or silent failures."
+    required: false
+    default: "false"
 
   bump:
-    description: Force bump type (patch|minor|major)
+    description: Force bump type (patch|minor|major|prerelease)
     required: false
   prerelease:
     description: Create prerelease version (optional identifier)
     required: false
+  stable:
+    description: Graduate prerelease packages to stable without bumping
+    required: false
+    default: "false"
   sync:
     description: Use synchronized versioning
     required: false
@@ -89,8 +97,13 @@ inputs:
     description: SSH deploy key for git push (enables SSH checkout when not dry-run)
     required: false
 
+  reconcile:
+    description: "Bypass the skip-pattern guard in standing-pr-update mode (for post-release reconcile runs, where HEAD is a release commit)"
+    required: false
+    default: "false"
+
   pr:
-    description: Pull request number (preview mode)
+    description: Pull request number (preview mode; standing-pr-publish mode when not triggered by a pull_request event)
     required: false
   repo:
     description: Repository in owner/repo format (preview mode)
@@ -114,6 +127,35 @@ inputs:
     required: false
     default: "true"
 
+  package:
+    description: Package to backfill (backfill mode; defaults to the package.json name at `path`)
+    required: false
+  path:
+    description: Package directory to backfill (backfill mode)
+    required: false
+  all:
+    description: Backfill every package in the workspace (backfill mode)
+    required: false
+    default: "false"
+  from:
+    description: Earliest version to backfill, inclusive (backfill mode)
+    required: false
+  to:
+    description: Latest version to backfill, inclusive (backfill mode)
+    required: false
+  update-releases:
+    description: Update matching GitHub release bodies via `gh release edit` (backfill mode)
+    required: false
+    default: "false"
+  only-missing:
+    description: With update-releases, skip releases already carrying releasekit notes (backfill mode)
+    required: false
+    default: "false"
+  apply:
+    description: Apply changes instead of a dry-run preview (backfill mode)
+    required: false
+    default: "false"
+
 outputs:
   success:
     description: Whether action completed successfully
@@ -121,6 +163,15 @@ outputs:
   mode:
     description: Executed mode
     value: ${{ steps.run.outputs.mode }}
+  standing-pr-action:
+    description: Standing PR action taken (created, updated, closed, or noop)
+    value: ${{ steps.run.outputs.standing-pr-action }}
+  standing-pr-number:
+    description: Standing PR number
+    value: ${{ steps.run.outputs.standing-pr-number }}
+  standing-pr-url:
+    description: Standing PR URL
+    value: ${{ steps.run.outputs.standing-pr-url }}
   should-release:
     description: Whether a release should proceed (gate mode)
     value: ${{ steps.run.outputs.should-release }}
@@ -133,6 +184,9 @@ outputs:
   gate-target:
     description: Resolved target packages (gate mode)
     value: ${{ steps.run.outputs.gate-target }}
+  gate-stable:
+    description: Whether the release should be a stable graduation (gate mode, release:graduate label)
+    value: ${{ steps.run.outputs.gate-stable }}
   has-changes:
     description: "Whether a release has changes (release mode, requires json: true)"
     value: ${{ steps.run.outputs.has-changes }}
@@ -156,23 +210,23 @@ runs:
   using: composite
   steps:
     - name: Checkout (SSH)
-      if: ${{ inputs.ssh-key != '' && inputs.dry-run != 'true' && inputs.mode != 'gate' }}
-      uses: actions/checkout@v6
+      if: ${{ inputs.skip-checkout != 'true' && inputs.ssh-key != '' && inputs.dry-run != 'true' && inputs.mode != 'gate' }}
+      uses: actions/checkout@v7
       with:
         ssh-key: ${{ inputs.ssh-key }}
         fetch-depth: 0
 
     - name: Checkout (read-only)
-      if: ${{ inputs.ssh-key == '' || inputs.dry-run == 'true' || inputs.mode == 'gate' }}
-      uses: actions/checkout@v6
+      if: ${{ inputs.skip-checkout != 'true' && (inputs.ssh-key == '' || inputs.dry-run == 'true' || inputs.mode == 'gate') }}
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0
 
     - name: Setup pnpm
-      uses: pnpm/action-setup@v5
+      uses: pnpm/action-setup@v6
 
     - name: Setup Node
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@v7
       with:
         node-version: ${{ inputs.node-version }}
         cache: 'pnpm'
@@ -181,6 +235,27 @@ runs:
       run: pnpm install --frozen-lockfile
       working-directory: ${{ github.action_path }}
       shell: bash
+
+    - name: Fetch and sync remote (skip-checkout)
+      if: ${{ inputs.skip-checkout == 'true' }}
+      run: |
+        CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+        if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+          echo "Error: repository is in detached HEAD state; cannot sync remote branch."
+          exit 1
+        fi
+        git config core.hooksPath /dev/null
+        git fetch origin
+        if [ -n "$(git status --porcelain)" ]; then
+          git stash push -u -m "temp stash for releasekit"
+          git rebase "origin/$CURRENT_BRANCH" || { git rebase --abort 2>/dev/null || true; echo "Warning: rebase failed; falling back to git reset --hard. Local commits ahead of origin will be discarded."; git reset --hard "origin/$CURRENT_BRANCH"; }
+          git stash pop || { echo "Stash pop failed, resetting to clean working tree. Stashed changes remain available."; git reset --hard; exit 1; }
+        else
+          git rebase "origin/$CURRENT_BRANCH" || { git rebase --abort 2>/dev/null || true; echo "Warning: rebase failed; falling back to git reset --hard. Local commits ahead of origin will be discarded."; git reset --hard "origin/$CURRENT_BRANCH"; }
+        fi
+        git config --unset core.hooksPath || true
+      shell: bash
+      working-directory: ${{ inputs.project-dir || '.' }}
 
     - name: Configure git
       run: |
@@ -192,6 +267,36 @@ runs:
       id: run
       shell: bash
       working-directory: ${{ inputs.project-dir || '.' }}
+      run: |
+        echo "Current directory: $(pwd)"
+        echo "Git status:"
+        git status --porcelain || echo "Not a git repository"
+        echo "Git config:"
+        git config --list --local | head -10
+        echo "Environment:"
+        echo "INPUT_TARGET: $INPUT_TARGET"
+        echo "INPUT_DRY_RUN: $INPUT_DRY_RUN"
+        echo "INPUT_JSON: $INPUT_JSON"
+        echo "Running ReleaseKit with verbose output..."
+        set -x
+        node ${{ github.action_path }}/scripts/run-action.mjs
+        exit_code=$?
+        set +x
+        if [ $exit_code -ne 0 ]; then
+          echo "ReleaseKit failed with exit code: $exit_code"
+          echo "Checking for common issues..."
+          echo "Git status after failure:"
+          git status --porcelain
+          echo "Recent commits:"
+          git log --oneline -5 2>/dev/null || echo "Could not get git log"
+          echo "Package.json exists:"
+          ls -la package.json || echo "package.json not found"
+          echo "Node version:"
+          node --version
+          echo "PNPM version:"
+          pnpm --version 2>/dev/null || echo "pnpm not found"
+          exit 1
+        fi
       env:
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_CONFIG: ${{ inputs.config }}
@@ -202,6 +307,7 @@ runs:
         INPUT_QUIET: ${{ inputs.quiet }}
         INPUT_BUMP: ${{ inputs.bump }}
         INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        INPUT_STABLE: ${{ inputs.stable }}
         INPUT_SYNC: ${{ inputs.sync }}
         INPUT_TARGET: ${{ inputs.target }}
         INPUT_SCOPE: ${{ inputs.scope }}
@@ -213,6 +319,7 @@ runs:
         INPUT_SKIP_GIT: ${{ inputs.skip-git }}
         INPUT_SKIP_GITHUB_RELEASE: ${{ inputs.skip-github-release }}
         INPUT_SKIP_VERIFICATION: ${{ inputs.skip-verification }}
+        INPUT_RECONCILE: ${{ inputs.reconcile }}
         INPUT_PR: ${{ inputs.pr }}
         INPUT_REPO: ${{ inputs.repo }}
         INPUT_PREVIEW_PRERELEASE: ${{ inputs.preview-prerelease }}
@@ -220,8 +327,15 @@ runs:
         INPUT_PREVIEW_DRY_RUN: ${{ inputs.preview-dry-run }}
         INPUT_PREVIEW_TARGET: ${{ inputs.preview-target }}
         INPUT_SUMMARY: ${{ inputs.summary }}
+        INPUT_PACKAGE: ${{ inputs.package }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_ALL: ${{ inputs.all }}
+        INPUT_FROM: ${{ inputs.from }}
+        INPUT_TO: ${{ inputs.to }}
+        INPUT_UPDATE_RELEASES: ${{ inputs.update-releases }}
+        INPUT_ONLY_MISSING: ${{ inputs.only-missing }}
+        INPUT_APPLY: ${{ inputs.apply }}
         GITHUB_TOKEN: ${{ github.token }}
         NPM_TOKEN: ${{ inputs.npm-token }}
         VERBOSE: ${{ inputs.verbose }}
         OLLAMA_API_KEY: ${{ env.OLLAMA_API_KEY }}
-      run: node ${{ github.action_path }}/scripts/run-action.mjs

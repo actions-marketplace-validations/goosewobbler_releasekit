@@ -1,12 +1,17 @@
+import { debug } from '@releasekit/core';
 import type { CompleteOptions } from '../core/types.js';
 import { LLMError } from '../errors/index.js';
+import { extractJsonFromResponse } from '../utils/json.js';
 import { BaseLLMProvider } from './base.js';
-import { LLM_DEFAULTS } from './defaults.js';
+import type { CompleteResult, LLMMessage } from './messages.js';
+import { debugLogMessages } from './messages.js';
+import type { ProviderCapabilities } from './provider.js';
+import { isRetryableProviderError, isRetryableStatus } from './retryable.js';
 
 export interface OllamaConfig {
   apiKey?: string;
   baseURL?: string;
-  model?: string;
+  model: string;
 }
 
 interface OllamaChatRequest {
@@ -16,6 +21,7 @@ interface OllamaChatRequest {
     content: string;
   }>;
   stream?: boolean;
+  format?: Record<string, unknown>;
   options?: {
     num_predict?: number;
     temperature?: number;
@@ -32,22 +38,31 @@ interface OllamaChatResponse {
 
 export class OllamaProvider extends BaseLLMProvider {
   readonly name = 'ollama';
+  readonly capabilities: ProviderCapabilities = {
+    systemRole: true,
+    structuredOutputs: true,
+    toolUse: false,
+    honorsTemperature: true,
+  };
+
   private baseURL: string;
   private model: string;
   private apiKey?: string;
 
-  constructor(config: OllamaConfig = {}) {
+  constructor(config: OllamaConfig) {
     super();
 
     this.baseURL = config.baseURL ?? process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434';
-    this.model = config.model ?? process.env.OLLAMA_MODEL ?? LLM_DEFAULTS.models.ollama;
+    this.model = config.model;
     this.apiKey = config.apiKey ?? process.env.OLLAMA_API_KEY;
   }
 
-  async complete(prompt: string, options?: CompleteOptions): Promise<string> {
+  async complete(messages: LLMMessage[], options?: CompleteOptions): Promise<CompleteResult> {
+    debugLogMessages(this.name, messages);
+
     const requestBody: OllamaChatRequest = {
       model: this.model,
-      messages: [{ role: 'user', content: prompt }],
+      messages: messages.map((m) => ({ role: m.role, content: m.content })),
       stream: false,
       options: {
         num_predict: this.getMaxTokens(options),
@@ -55,6 +70,11 @@ export class OllamaProvider extends BaseLLMProvider {
       },
     };
 
+    if (options?.schema) {
+      requestBody.format = options.schema as Record<string, unknown>;
+    }
+
+    const signal = this.timeoutSignal(options);
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -67,6 +87,7 @@ export class OllamaProvider extends BaseLLMProvider {
         method: 'POST',
         headers,
         body: JSON.stringify(requestBody),
+        signal,
       });
 
       if (!response.ok) {
@@ -77,10 +98,13 @@ export class OllamaProvider extends BaseLLMProvider {
             : 'OLLAMA_API_KEY is not set. Set the environment variable or use --no-llm to skip LLM processing.';
           throw new LLMError(
             `Ollama request failed: ${response.status} ${response.statusText}${text ? ` - ${text}` : ''}. ${keyHint}`,
+            { retryable: false },
           );
         }
         const text = await response.text();
-        throw new LLMError(`Ollama request failed: ${response.status} ${text}`);
+        throw new LLMError(`Ollama request failed: ${response.status} ${text}`, {
+          retryable: isRetryableStatus(response.status),
+        });
       }
 
       const data = (await response.json()) as OllamaChatResponse;
@@ -89,11 +113,30 @@ export class OllamaProvider extends BaseLLMProvider {
         throw new LLMError('Empty response from Ollama');
       }
 
-      return data.message.content;
+      const content = data.message.content;
+
+      if (options?.schema) {
+        try {
+          // Strip markdown code fences / preamble first — cloud-hosted models (e.g. via ollama.com)
+          // often wrap schema-constrained output in a ```json fence despite the `format` request.
+          const structured = JSON.parse(extractJsonFromResponse(content));
+          return { content, structured };
+        } catch (e) {
+          debug(`Ollama: failed to parse structured response: ${e instanceof Error ? e.message : String(e)}`);
+          return { content };
+        }
+      }
+
+      return { content };
     } catch (error) {
       if (error instanceof LLMError) throw error;
-
-      throw new LLMError(`Ollama error: ${error instanceof Error ? error.message : String(error)}`);
+      if (signal.aborted) {
+        throw new LLMError(`Ollama request timed out after ${this.getTimeout(options)}ms`, { retryable: true });
+      }
+      throw new LLMError(`Ollama error: ${error instanceof Error ? error.message : String(error)}`, {
+        cause: error,
+        retryable: isRetryableProviderError(error),
+      });
     }
   }
 }

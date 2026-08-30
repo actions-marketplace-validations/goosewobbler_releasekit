@@ -1,6 +1,6 @@
 {
   "name": "@releasekit/notes",
-  "version": "0.12.0",
+  "version": "0.41.2",
   "description": "Release notes and changelog generation with LLM-powered enhancement and flexible templating",
   "type": "module",
   "module": "./dist/index.js",
@@ -57,22 +57,26 @@
     "access": "public"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.86.0",
-    "@octokit/rest": "^22.0.1",
+    "@anthropic-ai/sdk": "^0.115.0",
+    "@octokit/rest": "catalog:",
     "chalk": "catalog:",
     "commander": "catalog:",
     "ejs": "^4.0.1",
     "handlebars": "^4.7.9",
-    "liquidjs": "^10.25.5",
+    "jsonc-parser": "catalog:",
+    "liquidjs": "^10.27.2",
     "minimatch": "catalog:",
-    "openai": "^6.33.0",
+    "openai": "^6.49.0",
     "smol-toml": "catalog:",
+    "yaml": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",
     "@releasekit/config": "workspace:*",
     "@releasekit/core": "workspace:*",
+    "@releasekit/forge": "workspace:*",
+    "@releasekit/git": "workspace:*",
     "@types/ejs": "^3.1.5",
     "@types/node": "catalog:",
     "@vitest/coverage-v8": "catalog:",
@@ -81,6 +85,6 @@
     "vitest": "catalog:"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

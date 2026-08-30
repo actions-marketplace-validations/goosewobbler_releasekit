@@ -2,10 +2,11 @@ import type { VersionOutput } from '@releasekit/core';
 import { BasePublishError, PipelineError } from '../errors/index.js';
 import { runCargoPublishStage } from '../stages/cargo-publish.js';
 import { runGitCommitStage } from '../stages/git-commit.js';
-import { runGitPushStage } from '../stages/git-push.js';
+import { preparePushSetup, pushPackageTag, runGitPushStage } from '../stages/git-push.js';
 import { runGithubReleaseStage } from '../stages/github-release.js';
 import { runNpmPublishStage } from '../stages/npm-publish.js';
 import { runPrepareStage } from '../stages/prepare.js';
+import { runPubPublishStage } from '../stages/pub-publish.js';
 import { runVerifyStage } from '../stages/verify.js';
 import type { PipelineContext, PublishCliOptions, PublishConfig, PublishOutput } from '../types.js';
 import { detectPackageManager } from '../utils/package-manager.js';
@@ -21,6 +22,9 @@ function inferStageName(error: unknown): string {
       NPM_AUTH_ERROR: 'npm-publish',
       CARGO_PUBLISH_ERROR: 'cargo-publish',
       CARGO_AUTH_ERROR: 'cargo-publish',
+      PUB_PUBLISH_ERROR: 'pub-publish',
+      PUB_AUTH_ERROR: 'pub-publish',
+      PUBSPEC_YAML_ERROR: 'prepare',
       VERIFICATION_FAILED: 'verify',
       GIT_PUSH_ERROR: 'git-push',
       GITHUB_RELEASE_ERROR: 'github-release',
@@ -49,11 +53,17 @@ export async function runPipeline(
       git: { committed: false, tags: [], pushed: false },
       npm: [],
       cargo: [],
+      pub: [],
       verification: [],
       githubReleases: [],
       publishSucceeded: false,
     },
   };
+
+  // Per-package mode: when every package has its own tag (async or sync+packageSpecificTags),
+  // push each tag immediately after that package publishes rather than all at the end.
+  // In sync mode with a single shared tag no update carries a tag, so batch mode is used.
+  const perPackageMode = input.updates.some((u) => !!u.tag);
 
   try {
     // Stage 2: Prepare (copy files, update Cargo.toml)
@@ -61,35 +71,107 @@ export async function runPipeline(
 
     // Stage 3: Git commit + tag
     // When skipGitCommit is set, the caller already created the commit and tags.
-    // Pre-populate the output so push and github-release stages work.
+    // Pre-populate the output so push and github-release stages work. Both consumer-facing
+    // tags and baseline tags need to be pushed; the github-release stage filters back down
+    // to consumer tags via `ctx.input.tags`.
     if (options.skipGitCommit && !options.skipGit) {
-      ctx.output.git.committed = !!input.commitMessage;
-      ctx.output.git.tags = [...input.tags];
+      // The caller already created the release commit AND it is already on the remote: the
+      // standing-PR squash merge landed it on the target branch before this publish ran. This
+      // runner has no local commit to contribute, so `committed` stays false and the push stage
+      // skips the branch push — only the tags need pushing. Pushing the branch here is at best a
+      // no-op and at worst races a concurrent push to the branch (e.g. a direct edit on GitHub),
+      // whose rejected `git push` would strand the tags and GitHub release behind it.
+      ctx.output.git.tags = [...input.tags, ...(input.baselineTags ?? [])];
     } else if (!options.skipGit) {
       await runGitCommitStage(ctx);
     }
 
     // Stage 4+5: Registry publishing
     if (!options.skipPublish) {
-      if (options.registry === 'all' || options.registry === 'npm') {
-        await runNpmPublishStage(ctx);
-      }
-      if (options.registry === 'all' || options.registry === 'cargo') {
-        await runCargoPublishStage(ctx);
+      if (!perPackageMode) {
+        // Batch mode: publish all, verify all, push all at the end (existing behavior).
+        if (options.registry === 'all' || options.registry === 'npm') {
+          await runNpmPublishStage(ctx);
+        }
+        if (options.registry === 'all' || options.registry === 'cargo') {
+          await runCargoPublishStage(ctx);
+        }
+        if (options.registry === 'all' || options.registry === 'pub') {
+          await runPubPublishStage(ctx);
+        }
+      } else if (!options.skipPublish) {
+        // Per-package mode: for each update, publish → verify → push its tag.
+        // Uses a single-update context so existing stage logic is fully reused.
+        // Prepare push setup once to avoid redundant method detection and branch resolution per package.
+        const pushSetup = !options.skipGit ? await preparePushSetup(ctx) : null;
+
+        for (const update of input.updates) {
+          const singleCtx: PipelineContext = {
+            ...ctx,
+            input: { ...ctx.input, updates: [update] },
+            output: {
+              dryRun: ctx.output.dryRun,
+              git: ctx.output.git, // shared so pushPackageTag accumulates into ctx.output.git
+              npm: [],
+              cargo: [],
+              pub: [],
+              verification: [],
+              githubReleases: [],
+              publishSucceeded: false,
+            },
+          };
+
+          if (options.registry === 'all' || options.registry === 'npm') {
+            await runNpmPublishStage(singleCtx);
+            ctx.output.npm.push(...singleCtx.output.npm);
+          }
+          if (options.registry === 'all' || options.registry === 'cargo') {
+            await runCargoPublishStage(singleCtx);
+            ctx.output.cargo.push(...singleCtx.output.cargo);
+          }
+          if (options.registry === 'all' || options.registry === 'pub') {
+            await runPubPublishStage(singleCtx);
+            ctx.output.pub.push(...singleCtx.output.pub);
+          }
+
+          if (!options.skipVerification) {
+            await runVerifyStage(singleCtx);
+            ctx.output.verification.push(...singleCtx.output.verification);
+          }
+
+          // Compute publish success for this package before pushing its tag
+          singleCtx.output.publishSucceeded =
+            singleCtx.output.npm.every((r) => r.success) &&
+            singleCtx.output.cargo.every((r) => r.success) &&
+            singleCtx.output.pub.every((r) => r.success);
+
+          // Push tag after publish/verify — only push if publish succeeded (commit is ready regardless).
+          if (!options.skipGit && update.tag && singleCtx.output.publishSucceeded) {
+            await pushPackageTag(update.tag, ctx, pushSetup || undefined);
+          }
+        }
       }
 
       // Stages throw on first failure (fail-fast), so reaching here means all packages succeeded.
-      ctx.output.publishSucceeded = ctx.output.npm.every((r) => r.success) && ctx.output.cargo.every((r) => r.success);
+      // Only relevant for batch mode; per-package mode sets publishSucceeded per-loop but doesn't accumulate.
+      if (!perPackageMode) {
+        ctx.output.publishSucceeded =
+          ctx.output.npm.every((r) => r.success) &&
+          ctx.output.cargo.every((r) => r.success) &&
+          ctx.output.pub.every((r) => r.success);
+      } else {
+        // In per-package mode every singleCtx succeeded (stages throw on failure), so the overall run succeeded.
+        ctx.output.publishSucceeded = true;
+      }
     }
 
-    // Stage 6: Verification
-    if (!options.skipVerification && !options.skipPublish) {
+    // Stage 6: Verification (batch mode only — per-package mode verified inline above)
+    if (!options.skipVerification && !options.skipPublish && !perPackageMode) {
       await runVerifyStage(ctx);
     }
 
-    // Stage 7: Git push (after publish to avoid tagging unpublished versions)
-    // Only push if publishing succeeded or was skipped
-    if (!options.skipGit && (options.skipPublish || ctx.output.publishSucceeded)) {
+    // Stage 7: Git push (batch mode only — per-package mode pushed inline above)
+    if (!options.skipGit && !perPackageMode && (options.skipPublish || ctx.output.publishSucceeded)) {
       await runGitPushStage(ctx);
     }
 

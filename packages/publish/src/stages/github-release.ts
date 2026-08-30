@@ -1,7 +1,7 @@
 import type { VersionPackageChangelog } from '@releasekit/core';
-import { debug, info, sanitizePackageName, success, warn } from '@releasekit/core';
+import { assertNotOption, debug, info, sanitizePackageName, success, warn } from '@releasekit/core';
 import type { GitHubReleaseResult, PipelineContext } from '../types.js';
-import { execCommand } from '../utils/exec.js';
+import { execCommand, execCommandSafe } from '../utils/exec.js';
 import { isPrerelease } from '../utils/semver.js';
 
 type BodySource = 'auto' | 'releaseNotes' | 'changelog' | 'generated' | 'none';
@@ -76,20 +76,36 @@ interface TagResolution {
   version: string;
 }
 
-/** Match a tag against a list of package names, handling two formats:
- *  - Raw:       "@scope/pkg@v1.0.0"   (separator: @, no tagTemplate)
- *  - Sanitized: "scope-pkg-v1.0.0"    (separator: -, tagTemplate uses ${packageName})
+/** Match a tag against a list of package names, handling three formats:
+ *  - Raw:           "@scope/pkg@v1.0.0"  (unsanitized name, "@" separator — no tagTemplate)
+ *  - Sanitized "@": "scope-pkg@v1.0.0"   (sanitized name, "@" separator — tagTemplate "${packageName}@v${version}")
+ *  - Sanitized "-": "scope-pkg-v1.0.0"   (sanitized name, "-" separator — tagTemplate "${packageName}-${version}")
  *
+ *  Checked in that order; for unscoped names the sanitized-"@" form collapses to the raw form.
  *  Sorts by sanitized name length (longest first) to resolve prefix ambiguity.
  */
 function resolveTagPackage(tag: string, packageNames: string[]): TagResolution | null {
   const sorted = [...packageNames].sort((a, b) => sanitizePackageName(b).length - sanitizePackageName(a).length);
   for (const packageName of sorted) {
+    // Raw, unsanitized name: "@scope/pkg@v1.0.0"
     const atPrefix = `${packageName}@`;
     if (tag.startsWith(atPrefix)) {
       return { packageName, version: tag.slice(atPrefix.length) };
     }
-    const dashPrefix = `${sanitizePackageName(packageName)}-`;
+    const sanitized = sanitizePackageName(packageName);
+    // Sanitized name + "@" separator: "scope-pkg@v1.0.0". Produced when `tagTemplate` is
+    // "${packageName}@v${version}" and the name is scoped — the template sanitizes the name into
+    // the tag, so neither the raw-"@" nor the sanitized-"-" branch matches it. (For unscoped names
+    // `sanitized` equals `packageName`, so this collapses to `atPrefix` above.)
+    const sanitizedAtPrefix = `${sanitized}@`;
+    if (sanitizedAtPrefix !== atPrefix && tag.startsWith(sanitizedAtPrefix)) {
+      const versionPart = tag.slice(sanitizedAtPrefix.length);
+      if (/^v?\d/.test(versionPart)) {
+        return { packageName, version: versionPart };
+      }
+    }
+    // Sanitized name + "-" separator: "scope-pkg-v1.0.0"
+    const dashPrefix = `${sanitized}-`;
     if (tag.startsWith(dashPrefix)) {
       const versionPart = tag.slice(dashPrefix.length);
       if (/^v?\d/.test(versionPart)) {
@@ -172,7 +188,13 @@ export async function runGithubReleaseStage(ctx: PipelineContext): Promise<void>
     return;
   }
 
-  const tags = output.git.tags.length > 0 ? output.git.tags : ctx.input.tags;
+  // Filter baseline tags out of the candidate set. Baselines are pushed alongside consumer
+  // tags but are an internal source-branch marker, not a consumer-facing release point, so
+  // they shouldn't get a GitHub Release. The fallback to ctx.input.tags is preserved for
+  // callers that bypass the git-commit stage and don't pre-populate output.git.tags.
+  const baselineSet = new Set(ctx.input.baselineTags ?? []);
+  const candidateTags = output.git.tags.length > 0 ? output.git.tags : ctx.input.tags;
+  const tags = candidateTags.filter((tag) => !baselineSet.has(tag));
 
   if (tags.length === 0) {
     info('No tags available for GitHub release');
@@ -183,7 +205,39 @@ export async function runGithubReleaseStage(ctx: PipelineContext): Promise<void>
   if (!firstTag) return;
   const tagsToRelease = config.githubRelease.perPackage ? tags : [firstTag];
 
+  const skipPackages = config.githubRelease.skipPackages ?? [];
+
   for (const tag of tagsToRelease) {
+    // Argument-injection guard (defense-in-depth): the git stage creates the tag first and already
+    // rejects a leading `-`, but reject here too so a `-`-prefixed tag can never reach the `gh` argv
+    // (cobra would parse it as a flag, e.g. -R/--repo). Non-critical per the per-tag error strategy —
+    // record the failure and move on rather than aborting the whole stage.
+    try {
+      assertNotOption(tag, 'tag');
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      warn(`Failed to create GitHub release for ${tag}: ${reason}`);
+      ctx.output.githubReleases.push({
+        tag,
+        draft: config.githubRelease.draft,
+        prerelease: false,
+        success: false,
+        reason,
+      });
+      continue;
+    }
+
+    // Skip GitHub release creation when the package is listed in githubRelease.skipPackages.
+    // Tags are still created (needed for changelog range detection on the next release) and
+    // npm publish still runs — only the `gh release create` call is skipped.
+    if (skipPackages.length > 0) {
+      const resolved = resolveTagPackage(tag, skipPackages);
+      if (resolved) {
+        debug(`Skipping GitHub release for ${resolved.packageName} (listed in githubRelease.skipPackages)`);
+        continue;
+      }
+    }
+
     // Determine if this is a pre-release
     // Limit tag length and use safer regex to prevent ReDoS
     const MAX_TAG_LENGTH = 1000;
@@ -233,6 +287,17 @@ export async function runGithubReleaseStage(ctx: PipelineContext): Promise<void>
       ghArgs.push('--notes', body);
     } else if (useGithubNotes) {
       ghArgs.push('--generate-notes');
+    }
+
+    // Check if GitHub release already exists before creating
+    if (!dryRun) {
+      const viewResult = await execCommandSafe('gh', ['release', 'view', tag], { dryRun: false });
+      if (viewResult.exitCode === 0) {
+        info(`GitHub release for ${tag} already exists, skipping`);
+        result.success = true;
+        ctx.output.githubReleases.push(result);
+        continue;
+      }
     }
 
     try {

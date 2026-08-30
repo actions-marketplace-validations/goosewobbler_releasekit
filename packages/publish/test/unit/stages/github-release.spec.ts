@@ -13,6 +13,7 @@ vi.mock('../../../src/utils/exec.js', () => ({
   execCommand: vi
     .fn()
     .mockResolvedValue({ stdout: 'https://github.com/owner/repo/releases/tag/v1.0.0', stderr: '', exitCode: 0 }),
+  execCommandSafe: vi.fn().mockResolvedValue({ stdout: '', stderr: 'not found', exitCode: 1 }),
 }));
 
 function createContext(overrides?: Partial<PipelineContext>): PipelineContext {
@@ -48,16 +49,46 @@ function createContext(overrides?: Partial<PipelineContext>): PipelineContext {
 describe('github-release stage', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
-    const { execCommand } = await import('../../../src/utils/exec.js');
+    const { execCommand, execCommandSafe } = await import('../../../src/utils/exec.js');
     vi.mocked(execCommand).mockResolvedValue({
       stdout: 'https://github.com/owner/repo/releases/tag/v1.0.0',
       stderr: '',
       exitCode: 0,
     });
+    // Default: release does not exist (gh release view returns non-zero)
+    vi.mocked(execCommandSafe).mockResolvedValue({ stdout: '', stderr: 'not found', exitCode: 1 });
     // Default: no RELEASE_NOTES.md on disk
     vi.mocked(fs.readFileSync).mockImplementation(() => {
       throw new Error('ENOENT');
     });
+  });
+
+  it('should not create a Release for baseline tags even when they appear in output.git.tags', async () => {
+    // Baseline tags (e.g. release/v1.0.0) get pushed alongside consumer tags but are an
+    // internal source-branch marker, not a consumer-facing release. The stage should read
+    // input.tags directly and ignore the merged set in output.git.tags.
+    const { execCommand } = await import('../../../src/utils/exec.js');
+    const ctx = createContext({
+      input: { dryRun: false, updates: [], changelogs: [], tags: ['v1.0.0'], baselineTags: ['release/v1.0.0'] },
+      output: {
+        dryRun: false,
+        // Both tags landed in output.git.tags via the pipeline's pre-populate path.
+        git: { committed: true, tags: ['v1.0.0', 'release/v1.0.0'], pushed: true },
+        npm: [],
+        cargo: [],
+        verification: [],
+        githubReleases: [],
+        publishSucceeded: true,
+      },
+    });
+
+    await runGithubReleaseStage(ctx);
+
+    // Exactly one Release call — the consumer tag.
+    expect(execCommand).toHaveBeenCalledTimes(1);
+    const args = vi.mocked(execCommand).mock.calls[0]?.[1] as string[];
+    expect(args).toEqual(expect.arrayContaining(['release', 'create', 'v1.0.0']));
+    expect(args).not.toEqual(expect.arrayContaining(['release/v1.0.0']));
   });
 
   it('should fall back to --generate-notes when notes is auto and no files/changelogs exist', async () => {
@@ -306,6 +337,35 @@ describe('github-release stage', () => {
     expect(args[args.indexOf('--title') + 1]).toBe('@releasekit/version: v0.4.1');
   });
 
+  it('should match a sanitized "name@vX.Y.Z" tag to release notes keyed by scoped package name', async () => {
+    // Regression: tagTemplate "${packageName}@v${version}" sanitizes a scoped name into
+    // the tag (e.g. wdio-tauri-plugin@v1.1.0). Previously neither the raw-"@" nor the sanitized-"-"
+    // branch matched it, so notes silently fell back to GitHub auto-generated notes.
+    const { execCommand } = await import('../../../src/utils/exec.js');
+
+    const ctx = createContext({
+      input: { dryRun: false, updates: [], changelogs: [], tags: ['wdio-tauri-plugin@v1.1.0'] },
+      output: {
+        dryRun: false,
+        git: { committed: true, tags: ['wdio-tauri-plugin@v1.1.0'], pushed: true },
+        npm: [],
+        cargo: [],
+        verification: [],
+        githubReleases: [],
+      },
+      releaseNotes: { '@wdio/tauri-plugin': 'LLM-enhanced release notes' },
+    });
+
+    await runGithubReleaseStage(ctx);
+
+    const args = vi.mocked(execCommand).mock.calls[0]?.[1] as string[];
+    expect(args).toContain('--notes');
+    expect(args[args.indexOf('--notes') + 1]).toBe('LLM-enhanced release notes');
+    expect(args).not.toContain('--generate-notes');
+    // Title resolves via the original (unsanitized) scoped name
+    expect(args[args.indexOf('--title') + 1]).toBe('@wdio/tauri-plugin: v1.1.0');
+  });
+
   it('should always use --generate-notes when body is generated', async () => {
     const { execCommand } = await import('../../../src/utils/exec.js');
     const config = getDefaultConfig();
@@ -505,5 +565,154 @@ describe('github-release stage', () => {
     const args = vi.mocked(execCommand).mock.calls[0]?.[1] as string[];
     const titleIndex = args.indexOf('--title');
     expect(args[titleIndex + 1]).toBe('my-package: v1.0.0');
+  });
+
+  it('should reject a tag beginning with a dash instead of passing it to gh', async () => {
+    const { execCommand, execCommandSafe } = await import('../../../src/utils/exec.js');
+    const ctx = createContext({
+      input: { dryRun: false, updates: [], changelogs: [], tags: ['--repo=evil'] },
+      output: {
+        dryRun: false,
+        git: { committed: true, tags: ['--repo=evil'], pushed: true },
+        npm: [],
+        cargo: [],
+        verification: [],
+        githubReleases: [],
+      },
+    });
+
+    await runGithubReleaseStage(ctx);
+
+    // The `-`-prefixed tag never reaches either gh invocation.
+    expect(execCommand).not.toHaveBeenCalled();
+    expect(execCommandSafe).not.toHaveBeenCalled();
+    expect(ctx.output.githubReleases).toHaveLength(1);
+    expect(ctx.output.githubReleases[0]?.success).toBe(false);
+    expect(ctx.output.githubReleases[0]?.reason).toMatch(/looks like an option/);
+  });
+
+  describe('githubRelease.skipPackages config', () => {
+    it('should skip GitHub release creation for packages listed in skipPackages', async () => {
+      const { execCommand } = await import('../../../src/utils/exec.js');
+      const config = getDefaultConfig();
+      config.githubRelease.skipPackages = ['pkg-internal'];
+
+      const ctx = createContext({
+        config,
+        input: {
+          dryRun: false,
+          updates: [{ packageName: 'pkg-internal', newVersion: '1.0.0', filePath: '/pkg/package.json' }],
+          changelogs: [],
+          tags: ['pkg-internal@v1.0.0'],
+        },
+        output: {
+          dryRun: false,
+          git: { committed: true, tags: ['pkg-internal@v1.0.0'], pushed: true },
+          npm: [],
+          cargo: [],
+          verification: [],
+          githubReleases: [],
+        },
+      });
+
+      await runGithubReleaseStage(ctx);
+
+      expect(execCommand).not.toHaveBeenCalled();
+      expect(ctx.output.githubReleases).toHaveLength(0);
+    });
+
+    it('should create GitHub release for packages not listed in skipPackages', async () => {
+      const { execCommand } = await import('../../../src/utils/exec.js');
+      const config = getDefaultConfig();
+      config.githubRelease.skipPackages = ['pkg-internal'];
+
+      const ctx = createContext({
+        config,
+        input: {
+          dryRun: false,
+          updates: [{ packageName: 'pkg-public', newVersion: '1.0.0', filePath: '/pkg/package.json' }],
+          changelogs: [],
+          tags: ['pkg-public@v1.0.0'],
+        },
+        output: {
+          dryRun: false,
+          git: { committed: true, tags: ['pkg-public@v1.0.0'], pushed: true },
+          npm: [],
+          cargo: [],
+          verification: [],
+          githubReleases: [],
+        },
+      });
+
+      await runGithubReleaseStage(ctx);
+
+      expect(execCommand).toHaveBeenCalledTimes(1);
+      expect(ctx.output.githubReleases).toHaveLength(1);
+      expect(ctx.output.githubReleases[0]?.success).toBe(true);
+    });
+
+    it('should skip only the listed packages in a multi-package release', async () => {
+      const { execCommand } = await import('../../../src/utils/exec.js');
+      const config = getDefaultConfig();
+      config.githubRelease.skipPackages = ['pkg-internal'];
+
+      const ctx = createContext({
+        config,
+        input: {
+          dryRun: false,
+          updates: [
+            { packageName: 'pkg-internal', newVersion: '1.0.0', filePath: '/internal/package.json' },
+            { packageName: 'pkg-public', newVersion: '1.0.0', filePath: '/public/package.json' },
+          ],
+          changelogs: [],
+          tags: ['pkg-internal@v1.0.0', 'pkg-public@v1.0.0'],
+        },
+        output: {
+          dryRun: false,
+          git: { committed: true, tags: ['pkg-internal@v1.0.0', 'pkg-public@v1.0.0'], pushed: true },
+          npm: [],
+          cargo: [],
+          verification: [],
+          githubReleases: [],
+        },
+      });
+
+      await runGithubReleaseStage(ctx);
+
+      expect(execCommand).toHaveBeenCalledTimes(1);
+      expect(ctx.output.githubReleases).toHaveLength(1);
+      const args = vi.mocked(execCommand).mock.calls[0]?.[1] as string[];
+      expect(args).toEqual(expect.arrayContaining(['release', 'create', 'pkg-public@v1.0.0']));
+    });
+  });
+
+  describe('GitHub release pre-existence check', () => {
+    it('should skip release creation when release already exists', async () => {
+      const { execCommand, execCommandSafe } = await import('../../../src/utils/exec.js');
+      const ctx = createContext();
+
+      // gh release view returns 0 (release exists)
+      vi.mocked(execCommandSafe).mockResolvedValue({ stdout: 'v1.0.0 release', stderr: '', exitCode: 0 });
+
+      await runGithubReleaseStage(ctx);
+
+      // Should not call gh release create
+      expect(execCommand).not.toHaveBeenCalled();
+      expect(ctx.output.githubReleases).toHaveLength(1);
+      expect(ctx.output.githubReleases[0]?.success).toBe(true);
+    });
+
+    it('should create release when it does not exist', async () => {
+      const { execCommand, execCommandSafe } = await import('../../../src/utils/exec.js');
+      const ctx = createContext();
+
+      // gh release view returns non-zero (release does not exist)
+      vi.mocked(execCommandSafe).mockResolvedValue({ stdout: '', stderr: 'release not found', exitCode: 1 });
+
+      await runGithubReleaseStage(ctx);
+
+      expect(execCommand).toHaveBeenCalledTimes(1);
+      expect(ctx.output.githubReleases[0]?.success).toBe(true);
+    });
   });
 });

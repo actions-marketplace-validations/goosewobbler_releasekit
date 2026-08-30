@@ -3,13 +3,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  buildBackfillArgs,
   buildGateArgs,
   buildGateSummary,
   buildPreviewArgs,
+  buildRefreshAfterReleaseArgs,
   buildReleaseArgs,
   buildReleaseSummary,
+  buildStandingPRPublishArgs,
+  buildStandingPRUpdateArgs,
   parseInputs,
   parseReleaseOutput,
+  resolveReleaseTags,
   runAction,
 } from '../../scripts/run-action.mjs';
 
@@ -71,6 +76,52 @@ describe('action runner', () => {
     expect(args).not.toContain('--quiet');
   });
 
+  it('should build release args with prerelease bump', () => {
+    const args = buildReleaseArgs({
+      config: undefined,
+      projectDir: '.',
+      bump: 'prerelease',
+      prerelease: undefined,
+      sync: 'false',
+      branch: 'main',
+      npmAuth: 'auto',
+      skipNotes: 'false',
+      skipPublish: 'false',
+      skipGit: 'false',
+      skipGithubRelease: 'false',
+      skipVerification: 'false',
+      dryRun: 'true',
+      json: 'true',
+      verbose: 'false',
+      quiet: 'false',
+    });
+
+    expect(args).toEqual(
+      expect.arrayContaining([
+        'release',
+        '--project-dir',
+        '.',
+        '--bump',
+        'prerelease',
+        '--branch',
+        'main',
+        '--npm-auth',
+        'auto',
+        '--dry-run',
+        '--json',
+      ]),
+    );
+    expect(args).not.toContain('--prerelease');
+    expect(args).not.toContain('--sync');
+    expect(args).not.toContain('--skip-notes');
+    expect(args).not.toContain('--skip-publish');
+    expect(args).not.toContain('--skip-git');
+    expect(args).not.toContain('--skip-github-release');
+    expect(args).not.toContain('--skip-verification');
+    expect(args).not.toContain('--verbose');
+    expect(args).not.toContain('--quiet');
+  });
+
   it('should build preview args and honor dry-run fallback', () => {
     const args = buildPreviewArgs({
       config: 'releasekit.config.json',
@@ -103,6 +154,87 @@ describe('action runner', () => {
     );
   });
 
+  it('should build standing-pr publish args with --pr', () => {
+    const args = buildStandingPRPublishArgs({
+      config: 'releasekit.config.json',
+      projectDir: '.',
+      npmAuth: 'oidc',
+      pr: '123',
+    });
+
+    expect(args).toEqual(
+      expect.arrayContaining([
+        'standing-pr',
+        'publish',
+        '--json',
+        '--config',
+        'releasekit.config.json',
+        '--project-dir',
+        '.',
+        '--npm-auth',
+        'oidc',
+        '--pr',
+        '123',
+      ]),
+    );
+  });
+
+  it('should omit --pr from standing-pr publish args when not provided', () => {
+    const args = buildStandingPRPublishArgs({
+      projectDir: '.',
+    });
+
+    expect(args).not.toContain('--pr');
+    expect(args).toEqual(expect.arrayContaining(['standing-pr', 'publish', '--json']));
+  });
+
+  it('should build standing-pr update args with --reconcile when reconcile is true', () => {
+    const args = buildStandingPRUpdateArgs({
+      projectDir: '.',
+      reconcile: 'true',
+    });
+
+    expect(args).toEqual(expect.arrayContaining(['standing-pr', 'update', '--json', '--reconcile']));
+  });
+
+  it('should omit --reconcile from standing-pr update args when reconcile is not set', () => {
+    const args = buildStandingPRUpdateArgs({
+      projectDir: '.',
+    });
+
+    expect(args).not.toContain('--reconcile');
+    expect(args).toEqual(expect.arrayContaining(['standing-pr', 'update', '--json']));
+  });
+
+  it('should build refresh-after-release args', () => {
+    const args = buildRefreshAfterReleaseArgs({ config: 'releasekit.config.json', projectDir: '.' });
+    expect(args).toEqual(['refresh-after-release', '--config', 'releasekit.config.json', '--project-dir', '.']);
+  });
+
+  it('should accept refresh-after-release mode and run the cli with its args', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'releasekit-action-runner-test-'));
+    tempDirs.push(tempDir);
+    const cliPath = path.join(tempDir, 'fake-cli.mjs');
+    fs.writeFileSync(cliPath, "console.log('ok')\n", 'utf-8');
+
+    const result = await runAction(
+      { mode: 'refresh-after-release', projectDir: '.', config: 'releasekit.config.json' },
+      { cliPath },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.args).toEqual(['refresh-after-release', '--config', 'releasekit.config.json', '--project-dir', '.']);
+  });
+
+  it('should parse INPUT_RECONCILE into the reconcile input', () => {
+    const parsed = parseInputs({
+      INPUT_MODE: 'standing-pr-update',
+      INPUT_RECONCILE: 'true',
+    });
+
+    expect(parsed.reconcile).toBe('true');
+  });
+
   it('should parse action env inputs', () => {
     const parsed = parseInputs({
       INPUT_MODE: 'preview',
@@ -124,17 +256,76 @@ describe('action runner', () => {
     expect(parsed?.versionOutput?.tags).toEqual(['v1.0.0']);
   });
 
+  it('should unwrap the data payload from an enveloped success result', () => {
+    const enveloped = JSON.stringify({
+      schemaVersion: 1,
+      status: 'success',
+      changed: true,
+      data: { versionOutput: { updates: [{ packageName: 'a' }], tags: ['v1.0.0'] } },
+      warnings: [],
+      errors: [],
+    });
+    expect(parseReleaseOutput(enveloped)?.versionOutput?.tags).toEqual(['v1.0.0']);
+  });
+
+  it('should unwrap null data from an enveloped error result', () => {
+    const enveloped = JSON.stringify({
+      schemaVersion: 1,
+      status: 'error',
+      changed: false,
+      data: null,
+      warnings: [],
+      errors: [{ code: 'GENERAL_ERROR', category: 'general', retryable: false, message: 'boom' }],
+    });
+    expect(parseReleaseOutput(enveloped)).toBeNull();
+  });
+
   it('should return undefined for non-JSON release output', () => {
     expect(parseReleaseOutput('plain logs')).toBeUndefined();
   });
 
-  it('should run cli with generated args', () => {
+  it('should prefer parsed tags over the git fallback', () => {
+    expect(resolveReleaseTags({ parsedTags: ['v1.2.3'], gitTags: ['v9.9.9'], allowRecovery: true })).toEqual({
+      tags: ['v1.2.3'],
+      recovered: false,
+    });
+  });
+
+  it('should recover tags from git when recovery is allowed and parsed tags are empty', () => {
+    expect(resolveReleaseTags({ parsedTags: [], gitTags: ['v1.2.3'], allowRecovery: true })).toEqual({
+      tags: ['v1.2.3'],
+      recovered: true,
+    });
+  });
+
+  it('should treat missing parsed tags as empty and recover from git when allowed', () => {
+    expect(resolveReleaseTags({ parsedTags: undefined, gitTags: ['v1.2.3'], allowRecovery: true })).toEqual({
+      tags: ['v1.2.3'],
+      recovered: true,
+    });
+  });
+
+  it('should not recover from git when recovery is not allowed', () => {
+    expect(resolveReleaseTags({ parsedTags: [], gitTags: ['v1.2.3'], allowRecovery: false })).toEqual({
+      tags: [],
+      recovered: false,
+    });
+  });
+
+  it('should emit empty tags when neither source has any', () => {
+    expect(resolveReleaseTags({ parsedTags: [], gitTags: [], allowRecovery: true })).toEqual({
+      tags: [],
+      recovered: false,
+    });
+  });
+
+  it('should run cli with generated args', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'releasekit-action-runner-test-'));
     tempDirs.push(tempDir);
     const cliPath = path.join(tempDir, 'fake-cli.mjs');
     fs.writeFileSync(cliPath, "console.log('ok')\n", 'utf-8');
 
-    const result = runAction(
+    const result = await runAction(
       {
         mode: 'release',
         projectDir: '.',
@@ -148,6 +339,52 @@ describe('action runner', () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('ok');
     expect(result.args).toContain('--dry-run');
+  });
+
+  it('should pass --output and read the structured result from that file (not stdout)', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'releasekit-action-runner-test-'));
+    tempDirs.push(tempDir);
+    const cliPath = path.join(tempDir, 'fake-cli.mjs');
+    // The fake CLI writes JSON to its --output path and prints noise to stdout — outputJson must come
+    // from the file, immune to the stdout noise.
+    fs.writeFileSync(
+      cliPath,
+      [
+        "import { writeFileSync } from 'node:fs';",
+        "const i = process.argv.indexOf('--output');",
+        "if (i !== -1) writeFileSync(process.argv[i + 1], JSON.stringify({ versionOutput: { tags: ['v1.2.3'] } }));",
+        "console.log('log noise that would corrupt JSON parsing');",
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const result = await runAction({ mode: 'release', projectDir: '.', json: 'true' }, { cliPath });
+
+    expect(result.args).toContain('--output');
+    expect(JSON.parse(result.outputJson)).toEqual({ versionOutput: { tags: ['v1.2.3'] } });
+  });
+
+  it('should not pass --output for modes without structured output (preview)', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'releasekit-action-runner-test-'));
+    tempDirs.push(tempDir);
+    const cliPath = path.join(tempDir, 'fake-cli.mjs');
+    fs.writeFileSync(cliPath, "console.log('ok')\n", 'utf-8');
+
+    const result = await runAction({ mode: 'preview', projectDir: '.' }, { cliPath });
+
+    expect(result.args).not.toContain('--output');
+    expect(result.outputJson).toBe('');
+  });
+
+  it('should resolve with non-zero status for a failing cli', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'releasekit-action-runner-test-'));
+    tempDirs.push(tempDir);
+    const cliPath = path.join(tempDir, 'fake-cli.mjs');
+    fs.writeFileSync(cliPath, 'process.exit(1)\n', 'utf-8');
+
+    const result = await runAction({ mode: 'release', projectDir: '.', npmAuth: 'auto' }, { cliPath });
+
+    expect(result.status).toBe(1);
   });
 
   it('should build gate args with --json and --scope', () => {
@@ -171,6 +408,81 @@ describe('action runner', () => {
         'electron',
       ]),
     );
+  });
+
+  it('should build backfill args for --all with release updates', () => {
+    const args = buildBackfillArgs({
+      config: 'releasekit.config.json',
+      backfillAll: 'true',
+      backfillUpdateReleases: 'true',
+      backfillOnlyMissing: 'true',
+      backfillApply: 'true',
+    });
+
+    expect(args).toEqual(
+      expect.arrayContaining([
+        'backfill',
+        '--config',
+        'releasekit.config.json',
+        '--all',
+        '--update-releases',
+        '--only-missing',
+        '--apply',
+      ]),
+    );
+    // backfill resolves the project via the runner's cwd, not a CLI flag.
+    expect(args).not.toContain('--project-dir');
+  });
+
+  it('should build single-package backfill args and omit unset flags', () => {
+    const args = buildBackfillArgs({
+      backfillPackage: '@scope/pkg',
+      backfillPath: 'packages/pkg',
+      backfillFrom: '1.1.0',
+    });
+
+    expect(args).toEqual(
+      expect.arrayContaining(['backfill', '--package', '@scope/pkg', '--path', 'packages/pkg', '--from', '1.1.0']),
+    );
+    expect(args).not.toContain('--all');
+    expect(args).not.toContain('--to');
+    expect(args).not.toContain('--update-releases');
+    expect(args).not.toContain('--only-missing');
+    expect(args).not.toContain('--apply');
+  });
+
+  it('should accept backfill mode and map its inputs', () => {
+    const parsed = parseInputs({
+      INPUT_MODE: 'backfill',
+      INPUT_PACKAGE: '@scope/pkg',
+      INPUT_ALL: 'true',
+      INPUT_FROM: '1.0.0',
+      INPUT_UPDATE_RELEASES: 'true',
+      INPUT_APPLY: 'true',
+    });
+
+    expect(parsed.mode).toBe('backfill');
+    expect(parsed.backfillPackage).toBe('@scope/pkg');
+    expect(parsed.backfillAll).toBe('true');
+    expect(parsed.backfillFrom).toBe('1.0.0');
+    expect(parsed.backfillUpdateReleases).toBe('true');
+    expect(parsed.backfillApply).toBe('true');
+  });
+
+  it('should dispatch backfill mode to the backfill subcommand', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'releasekit-action-runner-test-'));
+    tempDirs.push(tempDir);
+    const cliPath = path.join(tempDir, 'fake-cli.mjs');
+    fs.writeFileSync(cliPath, 'console.log(process.argv.slice(2).join(" "))\n', 'utf-8');
+
+    const result = await runAction(
+      { mode: 'backfill', projectDir: '.', backfillAll: 'true', backfillApply: 'true' },
+      { cliPath },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.args).toEqual(expect.arrayContaining(['backfill', '--all', '--apply']));
+    expect(result.stdout).toContain('backfill --all --apply');
   });
 
   it('should parse gate outputs from JSON stdout', () => {

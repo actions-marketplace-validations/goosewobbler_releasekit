@@ -97,26 +97,36 @@ Controls release notes generation. Release notes are a separate output from the 
 
 Set to `false` to explicitly disable when it has been enabled via config inheritance.
 
-When an object with a `mode` or `file` property, release notes are written to a file. When only `llm` is present (no `mode`/`file`), the LLM runs but no file is written — the generated content is passed to the publish step for use as a GitHub release body.
-
-### `notes.releaseNotes.mode`
-
-| Value | Behaviour |
-|-------|-----------|
-| `"root"` | Write `RELEASE_NOTES.md` at the repo root |
-| `"packages"` | Write one release notes file per package |
-| `"both"` | Write both root and per-package files |
+Release notes are **not** a changelog. By default they have no file — the generated content is passed to the publish step for the GitHub release body. In-repo file output is opt-in via `file.dir`.
 
 ### `notes.releaseNotes.file`
 
-Override the release notes file name.
+Optional in-repo file output. Omit to keep release notes only on the GitHub release body (the default). When set, writes one **immutable file per version** under `dir`:
 
-**Type:** `string`
-**Default:** `"RELEASE_NOTES.md"`
+| Layout | Path |
+|--------|------|
+| Monorepo | `release-notes/<package>/<version>.md` |
+| Single-package repo | `release-notes/<version>.md` |
+
+Each release writes a new file keyed by version, so prior releases are never overwritten — a browsable, provider-independent per-release history (the primary target for non-GitHub projects).
+
+| Option | Type | Default |
+|--------|------|---------|
+| `dir` | `string` | `"release-notes"` |
+
+```json
+{
+  "notes": {
+    "releaseNotes": {
+      "file": { "dir": "release-notes" }
+    }
+  }
+}
+```
 
 ### `notes.releaseNotes.templates`
 
-Same structure as `notes.changelog.templates`. See the [templates guide](./templates.md).
+Same structure as `notes.changelog.templates`. Renders each release's notes; for versioned files it's also the hook for docs-site frontmatter. Takes precedence over LLM prose and the default formatted section. See the [templates guide](./templates.md).
 
 ### `notes.releaseNotes.llm`
 
@@ -128,7 +138,7 @@ LLM configuration for release notes enhancement. Requires `provider` and `model`
     "releaseNotes": {
       "llm": {
         "provider": "openai",
-        "model": "gpt-4o-mini",
+        "model": "<your-model>",
         "tasks": { "enhance": true, "summarize": true }
       }
     }
@@ -136,7 +146,35 @@ LLM configuration for release notes enhancement. Requires `provider` and `model`
 }
 ```
 
-See the full LLM option reference below.
+See the [full LLM option reference](#llm-options-notesreleasenotesllm) below.
+
+### `notes.releaseNotes.links`
+
+Appends a links section to each release in the built-in markdown renderer. Only rendered when LLM categorisation is active (`tasks.categorize: true`).
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `title` | `string` | Section heading. Default: `"Links"` |
+| `items` | `object[]` | Static links: `{ label: string, url: string }` |
+| `fromPRBodyMarker` | `string` | Scan PR bodies for lines beginning with this marker and extract markdown links or bare URLs |
+
+```json
+{
+  "notes": {
+    "releaseNotes": {
+      "links": {
+        "title": "Migration guide",
+        "items": [
+          { "label": "v2.0 migration", "url": "https://docs.example.com/migrate-v2" }
+        ],
+        "fromPRBodyMarker": "Migration:"
+      }
+    }
+  }
+}
+```
+
+Links discovered via `fromPRBodyMarker` are de-duplicated against explicit `items` by URL (explicit `items` take precedence).
 
 ---
 
@@ -169,7 +207,7 @@ How existing changelog files are updated when new entries are generated.
 | Option | Type | Description |
 |--------|------|-------------|
 | `provider` | `string` | LLM provider key. See [LLM providers](./llm-providers.md). |
-| `model` | `string` | Model identifier (e.g. `"gpt-4o-mini"`, `"claude-sonnet-4-5"`) |
+| `model` | `string` | Model identifier for the selected provider (see [LLM providers](./llm-providers.md)). Required — releasekit ships no default, so pick a current model your provider serves. |
 
 ### Connection
 
@@ -182,22 +220,33 @@ How existing changelog files are updated when new entries are generated.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `concurrency` | `integer` | `3` | Maximum parallel LLM requests when enhancing entries |
+| `concurrency` | `integer` | `5` | Maximum parallel LLM requests when enhancing entries |
+| `examples` | `integer` | `3` | Past GitHub releases to fetch for few-shot style prompting (`0`–`5`; requires `GITHUB_TOKEN`) |
+
+### Context (`context`)
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `context.pullRequests` | `boolean` | `true` | Fetch linked PR bodies from GitHub for extra LLM context. Requires `GITHUB_TOKEN` or `GH_TOKEN`. |
 
 ### Model options (`options`)
 
-| Option | Type | Description |
-|--------|------|-------------|
-| `timeout` | `integer` (ms) | Request timeout |
-| `maxTokens` | `integer` | Maximum tokens to generate |
-| `temperature` | `number` | Sampling temperature (0–2) |
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `timeout` | `integer` (ms) | `60000` | Request timeout |
+| `maxTokens` | `integer` | `16384` | Maximum tokens to generate |
+| `temperature` | `number` | `0.7` | Sampling temperature (0–2) |
 
 ```json
 {
-  "llm": {
-    "provider": "openai",
-    "model": "gpt-4o",
-    "options": { "temperature": 0.3, "maxTokens": 1000 }
+  "notes": {
+    "releaseNotes": {
+      "llm": {
+        "provider": "openai",
+        "model": "<your-model>",
+        "options": { "temperature": 0.3, "maxTokens": 1000 }
+      }
+    }
   }
 }
 ```
@@ -208,12 +257,22 @@ How existing changelog files are updated when new entries are generated.
 |------|------|-------------|
 | `enhance` | `boolean` | Rewrite each entry description to be clearer and more user-facing |
 | `summarize` | `boolean` | Generate a one-paragraph summary of the release |
-| `categorize` | `boolean` | Group entries into user-friendly categories (Features, Fixes, …) |
+| `categorize` | `boolean` | Group entries into semantic categories (default set: Breaking, New, Changed, Fixed, Developer) |
 | `releaseNotes` | `boolean` | Generate full prose release notes suitable for a GitHub release body |
 
 ### Categories (`categories`)
 
-Provide hints to the `categorize` task for how to group entries.
+Controls how the `categorize` task groups entries. When not set, the following defaults are used:
+
+| Name | Description |
+|------|-------------|
+| `Breaking` | Breaking changes that require user action to upgrade |
+| `New` | New features and capabilities |
+| `Changed` | Changes to existing functionality |
+| `Fixed` | Bug fixes |
+| `Developer` | Internal changes: CI, tooling, dependencies, refactoring |
+
+Override with a custom list:
 
 ```json
 {
@@ -236,9 +295,62 @@ Each category object:
 | `description` | yes | Hint sent to the LLM to guide grouping |
 | `scopes` | no | Commit scopes that always map to this category |
 
+### Category order (`categoryOrder`)
+
+Controls the order in which LLM-categorised sections are rendered. Categories not listed appear after the listed ones. The `Breaking` category is always pinned first even if omitted from this list.
+
+**Type:** `string[]`
+**Default:** none (LLM-returned order is preserved)
+
+```json
+{
+  "llm": {
+    "categoryOrder": ["Breaking", "New", "Fixed", "Changed", "Developer"]
+  }
+}
+```
+
+### Scope validation (`scopes`)
+
+Controls how the LLM assigns scopes to entries. Invalid scopes trigger a corrective retry; after all retries are exhausted the scope is cleared rather than causing a failure.
+
+**`scopes.mode`**
+
+| Value | Behaviour |
+|-------|-----------|
+| `unrestricted` | LLM assigns any scope it chooses (default) |
+| `none` | Scopes are disabled; all assigned scopes are cleared |
+| `restricted` | Only scopes in `rules.allowed` are permitted |
+| `packages` | Scopes must match package names (monorepo only) |
+
+**`scopes.rules`**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `allowed` | `string[]` | — | Allowed scope values when mode is `restricted` |
+| `caseSensitive` | `boolean` | `false` | Whether scope matching is case-sensitive |
+
+```json
+{
+  "llm": {
+    "scopes": {
+      "mode": "restricted",
+      "rules": { "allowed": ["api", "ui", "core"] }
+    }
+  }
+}
+```
+
 ### Style (`style`)
 
-A brief style instruction appended to every LLM prompt.
+A style instruction appended to every LLM prompt.
+
+Default:
+```
+Write in past tense ("Added feature", not "Add feature"). Be concise and user-focused. Lead with the impact, not the implementation detail.
+```
+
+Override to change tone:
 
 ```json
 {
@@ -253,24 +365,39 @@ A brief style instruction appended to every LLM prompt.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `maxAttempts` | `integer` | `3` | Maximum retries on failure |
-| `initialDelay` | `integer` (ms) | `500` | Delay before first retry |
-| `maxDelay` | `integer` (ms) | `10000` | Maximum delay between retries |
+| `initialDelay` | `integer` (ms) | `1000` | Delay before first retry |
+| `maxDelay` | `integer` (ms) | `30000` | Maximum delay between retries |
 | `backoffFactor` | `number` | `2` | Exponential backoff multiplier |
 
 ### Prompt overrides (`prompts`)
 
-Override the built-in prompt instructions or templates for any task. The key is the task name (`enhance`, `categorize`, `summarize`, `releaseNotes`).
+`prompts.instructions` appends extra text to the built-in system prompt for a task. The structured output contract is preserved, so this is safe to use with all tasks.
+
+Available keys:
+
+| Key | Applies to |
+|-----|-----------|
+| `enhance` | Standalone `enhance` task (when `categorize` is disabled) |
+| `categorize` | Standalone `categorize` task (when `enhance` is disabled) |
+| `enhanceAndCategorize` | Combined task (when both `enhance` and `categorize` are enabled) |
+| `summarize` | `summarize` task |
+| `releaseNotes` | `releaseNotes` task |
 
 ```json
 {
-  "llm": {
-    "prompts": {
-      "instructions": {
-        "enhance": "Rewrite the description from a developer's perspective, keeping it technical."
+  "notes": {
+    "releaseNotes": {
+      "llm": {
+        "prompts": {
+          "instructions": {
+            "enhance": "Write from the perspective of an end user, not a developer.",
+            "releaseNotes": "Start with a one-sentence executive summary."
+          }
+        }
       }
     }
   }
 }
 ```
 
-See the [LLM providers guide](./llm-providers.md) for examples.
+See the [LLM providers guide](./llm-providers.md) for more examples.

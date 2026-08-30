@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockLoadReleaseKitConfig = vi.fn();
-const mockCreateOctokit = vi.fn();
-const mockFindMergedPRsForCommit = vi.fn();
+const mockForgeFor = vi.fn();
+const mockFindMergedPRsSinceLastRelease = vi.fn();
 const mockFetchPRLabels = vi.fn();
+const mockPostOrUpdateComment = vi.fn();
 
 vi.mock('@releasekit/config', () => ({
   loadConfig: (...args: unknown[]) => mockLoadReleaseKitConfig(...args),
@@ -23,10 +24,11 @@ vi.mock('node:child_process', () => ({
   execSync: vi.fn().mockReturnValue('feat: some feature\n'),
 }));
 
-vi.mock('../../src/preview-github.js', () => ({
-  createOctokit: (...args: unknown[]) => mockCreateOctokit(...args),
-  findMergedPRsForCommit: (...args: unknown[]) => mockFindMergedPRsForCommit(...args),
+vi.mock('../../src/github.js', () => ({
+  forgeFor: (...args: unknown[]) => mockForgeFor(...args),
+  findMergedPRsSinceLastRelease: (...args: unknown[]) => mockFindMergedPRsSinceLastRelease(...args),
   fetchPRLabels: (...args: unknown[]) => mockFetchPRLabels(...args),
+  postOrUpdateComment: (...args: unknown[]) => mockPostOrUpdateComment(...args),
 }));
 
 vi.mock('../../src/release.js', () => ({
@@ -36,15 +38,20 @@ vi.mock('../../src/release.js', () => ({
     if (scopeLabels[scopeName]) return scopeLabels[scopeName];
     throw new Error(`Scope "${scopeName}" not found`);
   },
+  runRelease: vi.fn(),
+}));
+
+vi.mock('../../src/git.js', () => ({
   getHeadCommitMessage: vi.fn().mockReturnValue('feat: some feature\n'),
   getGitHubContext: () => {
     const repo = process.env.GITHUB_REPOSITORY;
     const sha = process.env.GITHUB_SHA;
-    if (!repo || !sha) return null;
+    const token = process.env.GITHUB_TOKEN;
+    if (!repo) return null;
     const [owner, repoName] = repo.split('/');
-    return { owner, repo: repoName ?? '', sha };
+    return { owner, repo: repoName ?? '', sha: sha ?? null, token: token ?? null };
   },
-  runRelease: vi.fn(),
+  matchesSkipPattern: (msg: string, patterns: string[]) => patterns.find((p) => msg.includes(p)),
 }));
 
 describe('Gate', () => {
@@ -60,9 +67,10 @@ describe('Gate', () => {
           major: 'bump:major',
           minor: 'bump:minor',
           patch: 'bump:patch',
-          stable: 'release:stable',
-          prerelease: 'release:prerelease',
+          graduate: 'release:graduate',
+          prerelease: 'channel:prerelease',
           skip: 'release:skip',
+          immediate: 'release:immediate',
         },
       },
     });
@@ -77,7 +85,7 @@ describe('Gate', () => {
   });
 
   async function runGate(opts: Record<string, unknown> = {}) {
-    const { runGate: gateFn } = await import('../../src/gate.js');
+    const { runGate: gateFn } = await import('../../src/gate/gate.js');
     return gateFn({
       projectDir: '/test',
       ...opts,
@@ -85,7 +93,7 @@ describe('Gate', () => {
   }
 
   it('should return shouldRelease: true when bump:minor label present (label trigger mode)', async () => {
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
     mockFetchPRLabels.mockResolvedValue(['bump:minor']);
 
     const result = await runGate();
@@ -105,10 +113,11 @@ describe('Gate', () => {
           minor: 'bump:minor',
           patch: 'bump:patch',
           skip: 'release:skip',
+          immediate: 'release:immediate',
         },
       },
     });
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
     mockFetchPRLabels.mockResolvedValue(['feat: something']);
 
     const result = await runGate();
@@ -117,7 +126,7 @@ describe('Gate', () => {
   });
 
   it('should return shouldRelease: false when no bump/release labels present (label trigger mode)', async () => {
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
     mockFetchPRLabels.mockResolvedValue(['enhancement']);
 
     const result = await runGate();
@@ -135,10 +144,11 @@ describe('Gate', () => {
           minor: 'bump:minor',
           patch: 'bump:patch',
           skip: 'release:skip',
+          immediate: 'release:immediate',
         },
       },
     });
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
     mockFetchPRLabels.mockResolvedValue(['release:skip']);
 
     const result = await runGate();
@@ -147,8 +157,18 @@ describe('Gate', () => {
     expect(result.reason).toContain('release:skip');
   });
 
+  it('should return shouldRelease: false and not notify when only release:skip label (label trigger mode)', async () => {
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+    mockFetchPRLabels.mockResolvedValue(['release:skip']);
+
+    const result = await runGate();
+
+    expect(result.shouldRelease).toBe(false);
+    expect(mockPostOrUpdateComment).not.toHaveBeenCalled();
+  });
+
   it('should return blocked: true when bump:major + bump:minor conflict', async () => {
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
     mockFetchPRLabels.mockResolvedValue(['bump:major', 'bump:minor']);
 
     const result = await runGate();
@@ -157,9 +177,9 @@ describe('Gate', () => {
     expect(result.shouldRelease).toBe(false);
   });
 
-  it('should return blocked: true when release:prerelease + release:stable conflict', async () => {
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
-    mockFetchPRLabels.mockResolvedValue(['release:prerelease', 'release:stable']);
+  it('should return blocked: true when channel:prerelease + release:graduate conflict', async () => {
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+    mockFetchPRLabels.mockResolvedValue(['channel:prerelease', 'release:graduate']);
 
     const result = await runGate();
 
@@ -168,7 +188,7 @@ describe('Gate', () => {
   });
 
   it('should resolve bump from bump:major label', async () => {
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
     mockFetchPRLabels.mockResolvedValue(['bump:major']);
 
     const result = await runGate();
@@ -177,7 +197,7 @@ describe('Gate', () => {
   });
 
   it('should resolve bump from bump:patch label', async () => {
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
     mockFetchPRLabels.mockResolvedValue(['bump:patch']);
 
     const result = await runGate();
@@ -185,14 +205,48 @@ describe('Gate', () => {
     expect(result.bump).toBe('patch');
   });
 
-  it('should return bump undefined when only release:stable label', async () => {
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
-    mockFetchPRLabels.mockResolvedValue(['release:stable']);
+  it('should return bump undefined when only release:graduate label', async () => {
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+    mockFetchPRLabels.mockResolvedValue(['release:graduate']);
 
     const result = await runGate();
 
     expect(result.shouldRelease).toBe(true);
     expect(result.bump).toBeUndefined();
+    expect(result.stable).toBe(true);
+  });
+
+  it('should return stable: false when only bump:patch label', async () => {
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+    mockFetchPRLabels.mockResolvedValue(['bump:patch']);
+
+    const result = await runGate();
+
+    expect(result.shouldRelease).toBe(true);
+    expect(result.bump).toBe('patch');
+    expect(result.stable).toBe(false);
+  });
+
+  it('should return stable: true when bump:patch and release:graduate labels present (stable takes precedence over bump)', async () => {
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+    mockFetchPRLabels.mockResolvedValue(['bump:patch', 'release:graduate']);
+
+    const result = await runGate();
+
+    expect(result.shouldRelease).toBe(true);
+    // release:graduate causes detectBumpFromLabels to return undefined (auto-detect from commits)
+    expect(result.bump).toBeUndefined();
+    expect(result.stable).toBe(true);
+  });
+
+  it('should return stable: false when release:graduate and channel:prerelease conflict', async () => {
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+    mockFetchPRLabels.mockResolvedValue(['release:graduate', 'channel:prerelease']);
+
+    const result = await runGate();
+
+    expect(result.blocked).toBe(true);
+    expect(result.stable).toBe(false);
   });
 
   it('should resolve scope via --scope flag', async () => {
@@ -210,7 +264,7 @@ describe('Gate', () => {
         },
       },
     });
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
     mockFetchPRLabels.mockResolvedValue(['bump:minor']);
 
     const result = await runGate({ scope: 'electron' });
@@ -233,7 +287,7 @@ describe('Gate', () => {
         },
       },
     });
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
     mockFetchPRLabels.mockResolvedValue(['bump:minor', 'scope:electron']);
 
     const result = await runGate();
@@ -243,7 +297,7 @@ describe('Gate', () => {
   });
 
   it('should return shouldRelease: false when HEAD commit matches skipPatterns', async () => {
-    const { getHeadCommitMessage } = await import('../../src/release.js');
+    const { getHeadCommitMessage } = await import('../../src/git.js');
     vi.mocked(getHeadCommitMessage).mockReturnValue('chore: release v1.0.0 [skip ci]\n');
     mockLoadReleaseKitConfig.mockReturnValue({
       ci: {
@@ -260,7 +314,7 @@ describe('Gate', () => {
         },
       },
     });
-    mockFindMergedPRsForCommit.mockResolvedValue([123]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
     mockFetchPRLabels.mockResolvedValue(['bump:minor']);
 
     const result = await runGate();
@@ -269,20 +323,110 @@ describe('Gate', () => {
     expect(result.reason).toContain('skip pattern');
   });
 
-  it('should throw with clear error when releaseStrategy is standing-pr', async () => {
-    mockLoadReleaseKitConfig.mockReturnValue({
-      ci: { releaseStrategy: 'standing-pr' },
+  describe('standing-pr strategy (immediate-release evaluator)', () => {
+    function standingPrConfig(extra: Record<string, unknown> = {}) {
+      return {
+        ci: {
+          releaseStrategy: 'standing-pr',
+          releaseTrigger: 'label',
+          labels: {
+            major: 'bump:major',
+            minor: 'bump:minor',
+            patch: 'bump:patch',
+            graduate: 'release:graduate',
+            prerelease: 'channel:prerelease',
+            skip: 'release:skip',
+            immediate: 'release:immediate',
+          },
+          ...extra,
+        },
+      };
+    }
+
+    it('should stay neutral for a merged PR without the immediate label', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(standingPrConfig());
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+      mockFetchPRLabels.mockResolvedValue(['bump:minor']);
+
+      const result = await runGate();
+
+      expect(result.shouldRelease).toBe(false);
+      expect(result.blocked).toBeUndefined();
+      expect(result.reason).toContain('standing release PR');
+      // Neutral PRs must not get the "didn't trigger a release" nag comment.
+      expect(mockPostOrUpdateComment).not.toHaveBeenCalled();
     });
 
-    await expect(runGate()).rejects.toThrow('standing-pr');
-  });
+    it('should not treat conflicting bump labels as blocking without the immediate label', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(standingPrConfig());
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+      mockFetchPRLabels.mockResolvedValue(['bump:major', 'bump:minor']);
 
-  it('should throw with clear error when releaseStrategy is scheduled', async () => {
-    mockLoadReleaseKitConfig.mockReturnValue({
-      ci: { releaseStrategy: 'scheduled' },
+      const result = await runGate();
+
+      expect(result.shouldRelease).toBe(false);
+      expect(result.blocked).toBeUndefined();
+      expect(mockPostOrUpdateComment).not.toHaveBeenCalled();
     });
 
-    await expect(runGate()).rejects.toThrow('scheduled');
+    it('should release with resolved bump and scope when the immediate label is present', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(standingPrConfig({ scopeLabels: { 'scope:tauri': '@wdio/tauri-*' } }));
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+      mockFetchPRLabels.mockResolvedValue(['release:immediate', 'bump:minor', 'scope:tauri']);
+
+      const result = await runGate();
+
+      expect(result.shouldRelease).toBe(true);
+      expect(result.bump).toBe('minor');
+      expect(result.scope).toBe('tauri');
+      expect(result.target).toBe('@wdio/tauri-*');
+    });
+
+    it('should not release but notify when immediate is present without a bump label', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(standingPrConfig());
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+      mockFetchPRLabels.mockResolvedValue(['release:immediate']);
+
+      const result = await runGate();
+
+      expect(result.shouldRelease).toBe(false);
+      expect(mockPostOrUpdateComment).toHaveBeenCalled();
+    });
+
+    it('should block on conflicting bump labels when the immediate label is present', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(standingPrConfig());
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+      mockFetchPRLabels.mockResolvedValue(['release:immediate', 'bump:major', 'bump:minor']);
+
+      const result = await runGate();
+
+      expect(result.shouldRelease).toBe(false);
+      expect(result.blocked).toBe(true);
+    });
+
+    it('should stay neutral for a feeder PR in commit trigger mode', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(standingPrConfig({ releaseTrigger: 'commit' }));
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+      mockFetchPRLabels.mockResolvedValue(['enhancement']);
+
+      const result = await runGate();
+
+      // Without the standing-pr guard, commit mode releases every merge — a feeder PR
+      // slipping through here would direct-release on every push.
+      expect(result.shouldRelease).toBe(false);
+      expect(result.reason).toContain('standing release PR');
+      expect(mockPostOrUpdateComment).not.toHaveBeenCalled();
+    });
+
+    it('should release on the immediate label alone in commit trigger mode (no bump label required)', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(standingPrConfig({ releaseTrigger: 'commit' }));
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([123]);
+      mockFetchPRLabels.mockResolvedValue(['release:immediate']);
+
+      const result = await runGate();
+
+      expect(result.shouldRelease).toBe(true);
+    });
   });
 
   it('should return shouldRelease: false with reason when no GitHub context', async () => {
@@ -305,7 +449,7 @@ describe('Gate', () => {
   });
 
   it('should populate prNumbers from merged PRs', async () => {
-    mockFindMergedPRsForCommit.mockResolvedValue([123, 456]);
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123, 456]);
     mockFetchPRLabels.mockResolvedValue(['bump:minor']);
 
     const result = await runGate();
@@ -313,14 +457,181 @@ describe('Gate', () => {
     expect(result.prNumbers).toEqual([123, 456]);
   });
 
-  it('should aggregate labels across multiple merged PRs', async () => {
-    mockFindMergedPRsForCommit.mockResolvedValue([123, 456]);
+  it('should return only the winning PR labels (no cross-PR union)', async () => {
+    mockLoadReleaseKitConfig.mockReturnValue({
+      ci: {
+        releaseTrigger: 'label',
+        labels: {
+          major: 'bump:major',
+          minor: 'bump:minor',
+          patch: 'bump:patch',
+          graduate: 'release:graduate',
+          prerelease: 'channel:prerelease',
+          skip: 'release:skip',
+          immediate: 'release:immediate',
+        },
+        scopeLabels: {
+          'scope:electron': '@wdio/electron-*',
+        },
+      },
+    });
+    // Newer PR (123) has the bump label; older PR (456) has only an unrelated label.
+    // git-log order is newest-first, so 123 should win and 456 must NOT contaminate.
+    mockFindMergedPRsSinceLastRelease.mockResolvedValue([123, 456]);
     mockFetchPRLabels.mockResolvedValueOnce(['bump:minor', 'scope:electron']).mockResolvedValueOnce(['enhancement']);
 
     const result = await runGate();
 
+    expect(result.shouldRelease).toBe(true);
     expect(result.labels).toContain('bump:minor');
     expect(result.labels).toContain('scope:electron');
-    expect(result.labels).toContain('enhancement');
+    // Critical: labels from the non-winning PR must not appear in the winning verdict.
+    expect(result.labels).not.toContain('enhancement');
+  });
+
+  describe('per-PR evaluation — wdio-desktop-mobile #225 + #224 regression', () => {
+    // PR #225 merged with `channel:prerelease` + `scope:tauri` (no bump:*) — gate must block.
+    // PR #224 merged later with `bump:minor` + `scope:utils` — gate must release #224 alone.
+    // Before this fix: gate unioned the labels and produced `preminor` for `@wdio/native-utils`.
+    // After: per-PR evaluation, #225's labels are ignored, #224 wins cleanly with `minor`.
+    const fullConfig = {
+      ci: {
+        releaseTrigger: 'label',
+        labels: {
+          major: 'bump:major',
+          minor: 'bump:minor',
+          patch: 'bump:patch',
+          graduate: 'release:graduate',
+          prerelease: 'channel:prerelease',
+          skip: 'release:skip',
+          immediate: 'release:immediate',
+        },
+        scopeLabels: {
+          'scope:utils': '@wdio/native-utils',
+          'scope:tauri': '@wdio/tauri-*',
+        },
+      },
+    };
+
+    it('should not produce preminor when an older prerelease-only PR is in the window', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(fullConfig);
+      // git-log order is newest-first: #224 (winner) before #225 (insufficient).
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([224, 225]);
+      mockFetchPRLabels
+        .mockResolvedValueOnce(['bump:minor', 'scope:utils']) // #224
+        .mockResolvedValueOnce(['channel:prerelease', 'scope:tauri']); // #225
+
+      const result = await runGate({ notify: false });
+
+      expect(result.shouldRelease).toBe(true);
+      expect(result.bump).toBe('minor');
+      expect(result.bump).not.toBe('preminor');
+      expect(result.target).toBe('@wdio/native-utils');
+      expect(result.scope).toBe('utils');
+      // #225's prerelease label must not contaminate the verdict.
+      expect(result.labels).not.toContain('channel:prerelease');
+      expect(result.labels).not.toContain('scope:tauri');
+    });
+
+    it('should expose per-PR evaluations for both PRs', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(fullConfig);
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([224, 225]);
+      mockFetchPRLabels
+        .mockResolvedValueOnce(['bump:minor', 'scope:utils'])
+        .mockResolvedValueOnce(['channel:prerelease', 'scope:tauri']);
+
+      const result = await runGate({ notify: false });
+
+      expect(result.evaluations).toHaveLength(2);
+      const winning = result.evaluations?.find((e) => e.prNumber === 224);
+      const skipped = result.evaluations?.find((e) => e.prNumber === 225);
+      expect(winning?.shouldRelease).toBe(true);
+      expect(skipped?.shouldRelease).toBe(false);
+      expect(skipped?.reason).toContain('channel:prerelease');
+      expect(skipped?.hasReleaseIntent).toBe(true);
+    });
+
+    it('should post a notify comment on the prerelease-only PR but not the winner', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(fullConfig);
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([224, 225]);
+      mockFetchPRLabels
+        .mockResolvedValueOnce(['bump:minor', 'scope:utils'])
+        .mockResolvedValueOnce(['channel:prerelease', 'scope:tauri']);
+
+      await runGate(); // notify defaults to true
+
+      // Notify is only posted on PR #225 (insufficient labels with intent),
+      // never on the winning PR #224.
+      expect(mockPostOrUpdateComment).toHaveBeenCalledTimes(1);
+      const [, prNumber, body, marker] = mockPostOrUpdateComment.mock.calls[0];
+      expect(prNumber).toBe(225);
+      expect(body).toContain('did not trigger a release');
+      expect(body).toContain('channel:prerelease');
+      expect(marker).toBe('<!-- releasekit-gate-notify -->');
+    });
+
+    it('should not post notify when notify=false', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue(fullConfig);
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([224, 225]);
+      mockFetchPRLabels
+        .mockResolvedValueOnce(['bump:minor', 'scope:utils'])
+        .mockResolvedValueOnce(['channel:prerelease', 'scope:tauri']);
+
+      await runGate({ notify: false });
+
+      expect(mockPostOrUpdateComment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('notify — silence on PRs without release intent', () => {
+    it('should not post notify when a PR has only unrelated labels', async () => {
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([1, 2]);
+      mockFetchPRLabels
+        .mockResolvedValueOnce(['bump:minor']) // #1: winner
+        .mockResolvedValueOnce(['enhancement', 'documentation']); // #2: no release intent
+
+      await runGate();
+
+      // PR #1 wins (no notify). PR #2 has no release-intent labels (no notify).
+      expect(mockPostOrUpdateComment).not.toHaveBeenCalled();
+    });
+
+    it('should post notify on a single PR with conflicting bump labels', async () => {
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([42]);
+      mockFetchPRLabels.mockResolvedValueOnce(['bump:major', 'bump:minor']);
+
+      const result = await runGate();
+
+      expect(result.blocked).toBe(true);
+      expect(mockPostOrUpdateComment).toHaveBeenCalledTimes(1);
+      const [, prNumber, body] = mockPostOrUpdateComment.mock.calls[0];
+      expect(prNumber).toBe(42);
+      expect(body).toContain('conflicting');
+      expect(body).toContain('bump:major');
+      expect(body).toContain('bump:minor');
+    });
+
+    it('should not post notify on commit-mode release:skip (intentional skip, not user error)', async () => {
+      mockLoadReleaseKitConfig.mockReturnValue({
+        ci: {
+          releaseTrigger: 'commit',
+          labels: {
+            major: 'bump:major',
+            minor: 'bump:minor',
+            patch: 'bump:patch',
+            graduate: 'release:graduate',
+            prerelease: 'channel:prerelease',
+            skip: 'release:skip',
+            immediate: 'release:immediate',
+          },
+        },
+      });
+      mockFindMergedPRsSinceLastRelease.mockResolvedValue([1]);
+      mockFetchPRLabels.mockResolvedValueOnce(['release:skip']);
+
+      await runGate();
+
+      expect(mockPostOrUpdateComment).not.toHaveBeenCalled();
+    });
   });
 });

@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { formatCommitMessage, formatTag, formatTagPrefix, formatVersionPrefix } from '../../../src/utils/formatting.js';
+import {
+  buildTagStripPatternFromTemplate,
+  deriveBaselineTagPrefix,
+  displayTag,
+  formatCommitMessage,
+  formatTag,
+  formatTagPrefix,
+  formatVersionPrefix,
+} from '../../../src/utils/formatting.js';
 
 vi.mock('../../../src/utils/logging.js', () => ({
   log: vi.fn(),
@@ -258,6 +266,129 @@ describe('formatting', () => {
       formatCommitMessage('chore: release ${' + 'packageName}@${' + 'version}', '1.0.0', 'my-package');
 
       expect(logSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('buildTagStripPatternFromTemplate', () => {
+    it('should generate strip pattern for ${packageName}@v${version} template', () => {
+      const result = buildTagStripPatternFromTemplate('${packageName}@v${version}', '@wdio/native-spy', 'v');
+      expect(result).toBe('wdio-native-spy@v');
+    });
+
+    it('should generate strip pattern for ${packageName}-v${version} template', () => {
+      const result = buildTagStripPatternFromTemplate('${packageName}-v${version}', '@scope/package', 'v');
+      expect(result).toBe('scope-package-v');
+    });
+
+    it('should generate strip pattern for v${version} template', () => {
+      const result = buildTagStripPatternFromTemplate('v${version}', 'any-package', 'v');
+      expect(result).toBe('v');
+    });
+
+    it('should handle unscoped package names', () => {
+      const result = buildTagStripPatternFromTemplate('${packageName}@v${version}', 'my-package', 'v');
+      expect(result).toBe('my-package@v');
+    });
+
+    it('should handle empty package name', () => {
+      const result = buildTagStripPatternFromTemplate('${packageName}@v${version}', '', 'v');
+      expect(result).toBe('@v');
+    });
+
+    it('should return empty string for empty template', () => {
+      const result = buildTagStripPatternFromTemplate('', '@wdio/native-spy', 'v');
+      expect(result).toBe('');
+    });
+
+    it('should escape special regex characters', () => {
+      const result = buildTagStripPatternFromTemplate('${packageName}.*+?^${}()|[]\\', '@wdio/native-spy', 'v');
+      expect(result).toBe('wdio-native-spy\\.\\*\\+\\?\\^\\$\\{\\}\\(\\)\\|\\[\\]\\\\');
+    });
+
+    it('should handle template without version placeholder', () => {
+      const result = buildTagStripPatternFromTemplate('${packageName}@${prefix}', '@wdio/native-spy', 'v');
+      expect(result).toBe('wdio-native-spy@v');
+    });
+
+    it('should handle template with multiple packageName occurrences', () => {
+      const result = buildTagStripPatternFromTemplate(
+        '${packageName}/${packageName}@v${version}',
+        '@wdio/native-spy',
+        'v',
+      );
+      expect(result).toBe('wdio-native-spy/wdio-native-spy@v');
+    });
+
+    it('should handle template with prefix at the end', () => {
+      const result = buildTagStripPatternFromTemplate('${packageName}${version}${prefix}', '@wdio/native-spy', 'v');
+      expect(result).toBe('wdio-native-spy');
+    });
+
+    it('should handle complex template with mixed placeholders', () => {
+      const result = buildTagStripPatternFromTemplate(
+        'release-${packageName}@${prefix}${version}-final',
+        '@wdio/native-spy',
+        'v',
+      );
+      expect(result).toBe('release-wdio-native-spy@v');
+    });
+  });
+
+  describe('deriveBaselineTagPrefix', () => {
+    it('should return undefined when template is undefined', () => {
+      expect(deriveBaselineTagPrefix(undefined, 'v')).toBeUndefined();
+    });
+
+    it('should extract the prefix before ${version}', () => {
+      expect(deriveBaselineTagPrefix('release/${' + 'prefix}${' + 'version}', 'v')).toBe('release/v');
+    });
+
+    it('should substitute ${prefix}', () => {
+      expect(deriveBaselineTagPrefix('${' + 'prefix}${' + 'version}', 'v')).toBe('v');
+    });
+
+    it('should substitute ${packageName} with sanitized package name', () => {
+      expect(deriveBaselineTagPrefix('release/${' + 'packageName}/${' + 'prefix}${' + 'version}', 'v', 'my-pkg')).toBe(
+        'release/my-pkg/v',
+      );
+    });
+
+    it('should sanitize scoped package names in ${packageName}', () => {
+      expect(
+        deriveBaselineTagPrefix('release/${' + 'packageName}/${' + 'prefix}${' + 'version}', 'v', '@scope/pkg'),
+      ).toBe('release/scope-pkg/v');
+    });
+
+    it('should replace ${packageName} with empty string when packageName is omitted', () => {
+      expect(deriveBaselineTagPrefix('release/${' + 'packageName}/${' + 'prefix}${' + 'version}', 'v')).toBe(
+        'release//v',
+      );
+    });
+
+    it('should return empty string when template starts with ${version}', () => {
+      expect(deriveBaselineTagPrefix('${' + 'version}', 'v')).toBe('');
+    });
+  });
+
+  describe('displayTag', () => {
+    it('should return the tag unchanged when baselineTagPrefix is undefined', () => {
+      expect(displayTag('release/v1.2.3', undefined, 'v')).toBe('release/v1.2.3');
+    });
+
+    it('should return the tag unchanged when it does not start with the baseline prefix', () => {
+      expect(displayTag('v1.2.3', 'release/v', 'v')).toBe('v1.2.3');
+    });
+
+    it('should replace the baseline prefix with the consumer prefix', () => {
+      expect(displayTag('release/v1.2.3', 'release/v', 'v')).toBe('v1.2.3');
+    });
+
+    it('should handle an empty consumer prefix', () => {
+      expect(displayTag('release/1.2.3', 'release/', '')).toBe('1.2.3');
+    });
+
+    it('should handle baseline prefix equal to the full tag', () => {
+      expect(displayTag('release/v', 'release/v', 'v')).toBe('v');
     });
   });
 });

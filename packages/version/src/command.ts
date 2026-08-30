@@ -1,3 +1,4 @@
+import { EXIT_CODES } from '@releasekit/core';
 import { Command } from 'commander';
 import { loadConfig } from './config.js';
 import { VersionEngine } from './core/versionEngine.js';
@@ -10,13 +11,29 @@ export function createVersionCommand(): Command {
     .description('Version a package or packages based on configuration')
     .option('-c, --config <path>', 'Path to config file (defaults to releasekit.config.json in current directory)')
     .option('-d, --dry-run', 'Dry run (no changes made)', false)
-    .option('-b, --bump <type>', 'Specify bump type (patch|minor|major)')
+    .option('-b, --bump <type>', 'Specify bump type (patch|minor|major|prerelease)')
     .option('-p, --prerelease [identifier]', 'Create prerelease version')
+    .option('--stable', 'Graduate prerelease packages to stable without bumping', false)
+    .option(
+      '--allow-first-bump',
+      'Acknowledge applying a bump on a first release with an already-stable manifest (silences the overshoot warning)',
+      false,
+    )
     .option('-s, --sync', 'Use synchronized versioning across all packages')
     .option('-j, --json', 'Output results as JSON', false)
     .option('-t, --target <packages>', 'Comma-delimited list of package names to target')
+    .option(
+      '--include-prerequisites',
+      'Also release the changed internal dependencies of --target packages (and the rest of their groups)',
+      false,
+    )
     .option('--project-dir <path>', 'Project directory to run commands in', process.cwd())
     .action(async (options) => {
+      if (options.stable && options.prerelease) {
+        console.error('Error: Cannot use both --stable and --prerelease at the same time');
+        process.exit(EXIT_CODES.INPUT_ERROR);
+      }
+
       if (options.json) {
         enableJsonOutput(options.dryRun);
       }
@@ -46,9 +63,12 @@ export function createVersionCommand(): Command {
         const runOptions = {
           bump: options.bump,
           prerelease: options.prerelease,
+          stable: options.stable,
+          allowFirstBump: options.allowFirstBump,
           dryRun: options.dryRun,
           sync: options.sync,
           targets: cliTargets.length > 0 ? cliTargets : undefined,
+          includePrerequisites: options.includePrerequisites,
         };
 
         const engine = new VersionEngine(config, runOptions);
@@ -60,8 +80,13 @@ export function createVersionCommand(): Command {
         log(`Config packages: ${JSON.stringify(config.packages)}`, 'debug');
         log(`Config sync: ${config.sync}`, 'debug');
 
+        const hasGroups = config.groups && Object.keys(config.groups).length > 0;
         const effectiveSync = options.sync || config.sync;
-        if (effectiveSync) {
+        if (hasGroups && !effectiveSync) {
+          log('Using version-groups strategy.', 'info');
+          engine.setStrategy('group');
+          await engine.run(pkgsResult, cliTargets);
+        } else if (effectiveSync) {
           log('Using sync versioning strategy.', 'info');
           engine.setStrategy('sync');
           await engine.run(pkgsResult);
